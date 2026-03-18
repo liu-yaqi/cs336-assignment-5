@@ -6,7 +6,7 @@ import math
 import random
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import typer
@@ -58,7 +58,7 @@ class EIConfig:
     max_tokens: int = 1024
     gpu_memory_utilization: float = 0.9
     wandb_project: str = "cs336-ei"
-    wandb_run_name: str | None = None
+    wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
 
     @property
@@ -446,7 +446,7 @@ def main(
     max_tokens: int = typer.Option(1024, help="Generation max tokens."),
     gpu_memory_utilization: float = typer.Option(0.9, help="vLLM GPU memory utilization."),
     wandb_project: str = typer.Option("cs336-ei", help="wandb project name."),
-    wandb_run_name: str | None = typer.Option(None, help="wandb run name."),
+    wandb_run_name: Optional[str] = typer.Option(None, help="wandb run name."),
     wandb_mode: str = typer.Option("online", help="wandb mode."),
 ) -> None:
     config = EIConfig(

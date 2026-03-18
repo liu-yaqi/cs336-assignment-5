@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 import typer
@@ -72,7 +72,7 @@ class GRPOConfig:
     top_p: float = 1.0
     cliprange: float = 0.2
     wandb_project: str = "cs336-grpo"
-    wandb_run_name: str | None = None
+    wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
 
     @property
@@ -583,7 +583,7 @@ def main(
     top_p: float = typer.Option(1.0, help="Top-p used for rollouts/eval."),
     cliprange: float = typer.Option(0.2, help="Clip range used only for grpo_clip."),
     wandb_project: str = typer.Option("cs336-grpo", help="wandb project name."),
-    wandb_run_name: str | None = typer.Option(None, help="wandb run name."),
+    wandb_run_name: Optional[str] = typer.Option(None, help="wandb run name."),
     wandb_mode: str = typer.Option("online", help="wandb mode."),
 ) -> None:
     config = GRPOConfig(
