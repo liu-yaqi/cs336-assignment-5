@@ -36,7 +36,7 @@ def compute_group_normalized_rewards(
     format_rewards = []
     answer_rewards = []
     for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
-        reward_result = reward_fn(response, ground_truth, fast=True)
+        reward_result = reward_fn(response, ground_truth)
         raw_rewards.append(reward_result["reward"])
         format_rewards.append(reward_result["format_reward"])
         answer_rewards.append(reward_result["answer_reward"])
@@ -54,6 +54,7 @@ def compute_group_normalized_rewards(
         group_std = raw_rewards.std(dim=-1, keepdim=True)  # (n_groups, 1)
         normalized_rewards = normalized_rewards / (group_std + advantage_eps)
     normalized_rewards = normalized_rewards.flatten()
+    raw_rewards = raw_rewards.flatten()
     
     metadata = {
         'total_rewards': float(torch.mean(raw_rewards)),
@@ -182,17 +183,14 @@ def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    if mask.type == torch.bool:
-        masked_tensor = torch.where(mask, tensor, torch.zeros_like(tensor)) # (batch_size, seq_len)
-    else:
-        masked_tensor = tensor * mask  # (batch_size, seq_len)
+    masked_tensor = torch.where(mask, tensor, torch.zeros_like(tensor)) # (batch_size, seq_len)
 
     if dim is None:
         return torch.sum(masked_tensor) / (torch.sum(mask) + 1e-8)
-    else:
+    else:   
         sum_result = torch.sum(masked_tensor, dim=dim)
         mask_sum = torch.sum(mask, dim=dim)
-        return sum_result / (mask_sum + 1e-8)
+        return sum_result / mask_sum 
 
 
 def grpo_microbatch_train_step(

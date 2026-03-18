@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
-DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "model" / "ei_checkpoints")
+DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "ei_checkpoints")
 
 
 @dataclass(slots=True)
@@ -413,7 +413,7 @@ def run_expert_iteration(config: EIConfig) -> None:
                 }
             )
 
-        checkpoint_dir = output_dir / f"ei_step_{ei_step}"
+        checkpoint_dir = output_dir / f"{config.wandb_run_name}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(checkpoint_dir)
         tokenizer.save_pretrained(checkpoint_dir)

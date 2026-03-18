@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "test.jsonl")
-DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "model" / "grpo_checkpoints")
+DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "grpo_checkpoints")
 
 
 @dataclass(slots=True)
@@ -66,7 +66,7 @@ class GRPOConfig:
         "grpo_clip",
     ] = DEFAULT_LOSS_TYPE
     use_std_normalization: bool = True
-    seed: int = 2026
+    seed: int = 69
     eval_every: int = 5
     n_eval_examples: int = 2048
     top_p: float = 1.0
@@ -496,7 +496,7 @@ def run_grpo(config: GRPOConfig) -> None:
             num_train_steps_per_rollout=config.num_train_steps_per_rollout,
         )
 
-        checkpoint_dir = output_dir / f"step_{grpo_step}"
+        checkpoint_dir = output_dir / f"{config.wandb_run_name}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(checkpoint_dir)
         tokenizer.save_pretrained(checkpoint_dir)

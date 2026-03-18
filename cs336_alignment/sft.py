@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "sft_gpt-oss-120b.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
-DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "model" / "sft_checkpoints")
+DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "sft_checkpoints")
 
 
 def set_seed(seed: int) -> None:
@@ -194,18 +194,19 @@ def sft_microbatch_train_step(
     normalize_constant: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Execute one SFT microbatch backward pass with gradient scaling."""
-    masked_token_count = max(normalize_constant, response_mask.sum().item())
+    # masked_token_count = max(normalize_constant, response_mask.sum().item())
     per_token_loss = -policy_log_probs
     loss = masked_normalize(
         tensor=per_token_loss,
         mask=response_mask,
-        normalize_constant=masked_token_count,
+        normalize_constant=normalize_constant,
     )
+    loss = loss / policy_log_probs.shape[0]
     loss = loss / gradient_accumulation_steps
     loss.backward()
 
     metadata = {
-        "masked_token_count": masked_token_count,
+        # "masked_token_count": masked_token_count,
     }
     return loss, metadata
 
@@ -373,7 +374,7 @@ def run_sft(config: SFTConfig) -> None:
                 step=step,
             )
 
-            checkpoint_dir = output_path / f"step_{step}"
+            checkpoint_dir = output_path / f"f{config.wandb_run_name}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)
