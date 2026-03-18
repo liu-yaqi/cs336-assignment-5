@@ -27,7 +27,7 @@ from cs336_alignment.utils import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = str(REPO_ROOT / "data" / "math" / "Qwen2.5-Math-1.5B")
+DEFAULT_MODEL_PATH = str(REPO_ROOT / "models" / "Qwen2.5-Math-1.5B")
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "model" / "ei_checkpoints")
