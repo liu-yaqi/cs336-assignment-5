@@ -1,0 +1,46 @@
+method: bayes
+metric:
+  name: eval/accuracy
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 3
+
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 5.0e-5
+  rollout_batch_size:
+    values: [128, 256, 512]
+  group_size:
+    values: [4, 8, 16]
+  epochs_per_rollout_batch:
+    values: [1, 2]
+  loss_type:
+    values: ["no_baseline", "reinforce_with_baseline", "grpo_clip"]
+  use_std_normalization:
+    values: [true, false]
+  
+
+command:
+  - ${env}
+  - python
+  - -m
+  - cs336_alignment.grpo_train
+  - --wandb-project
+  - cs336-grpo
+  - --wandb-mode
+  - online
+  - --device-train
+  - cuda:0
+  - --device-vllm
+  - cuda:1
+  - --train-data-path
+  - data/gsm8k/train.jsonl
+  - --test-data-path
+  - data/gsm8k/test.jsonl
+  - --model-path
+  - data/math/Qwen2.5-Math-1.5B
+  - ${args}

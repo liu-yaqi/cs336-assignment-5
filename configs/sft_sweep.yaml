@@ -1,0 +1,38 @@
+method: bayes
+metric:
+  name: eval/accuracy
+  goal: maximize
+
+# Early stop poor runs to save GPU time.
+early_terminate:
+  type: hyperband
+  min_iter: 2
+
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 1.0e-4
+  n_sft_steps:
+    values: [128, 256, 384]
+
+command:
+  - ${env}
+  - python
+  - -m
+  - cs336_alignment.sft
+  - --wandb-project
+  - cs336-sft
+  - --wandb-mode
+  - online
+  - --device-train
+  - cuda:0
+  - --device-vllm
+  - cuda:1
+  - --train-data-path
+  - data/math/sft_gpt-oss-120b.jsonl
+  - --test-data-path
+  - data/math/val.jsonl
+  - --model-path
+  - data/math/Qwen2.5-Math-1.5B
+  - ${args}
