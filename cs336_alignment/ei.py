@@ -58,7 +58,6 @@ class EIConfig:
     max_tokens: int = 1024
     gpu_memory_utilization: float = 0.9
     wandb_project: str = "cs336-ei"
-    wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_mode: str = "online"
 
@@ -291,7 +290,6 @@ def evaluate_model(
 def run_expert_iteration(config: EIConfig) -> None:
     wandb.init(
         project=config.wandb_project,
-        entity=config.wandb_entity,
         name=config.wandb_run_name,
         mode=config.wandb_mode,
         config={k: v for k, v in vars(config).items()},
@@ -448,7 +446,6 @@ def main(
     max_tokens: int = typer.Option(1024, help="Generation max tokens."),
     gpu_memory_utilization: float = typer.Option(0.9, help="vLLM GPU memory utilization."),
     wandb_project: str = typer.Option("cs336-ei", help="wandb project name."),
-    wandb_entity: str | None = typer.Option(None, help="wandb entity/team."),
     wandb_run_name: str | None = typer.Option(None, help="wandb run name."),
     wandb_mode: str = typer.Option("online", help="wandb mode."),
 ) -> None:
@@ -476,7 +473,6 @@ def main(
         max_tokens=max_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
         wandb_project=wandb_project,
-        wandb_entity=wandb_entity,
         wandb_run_name=wandb_run_name,
         wandb_mode=wandb_mode,
     )

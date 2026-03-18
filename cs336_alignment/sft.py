@@ -74,7 +74,6 @@ class SFTConfig:
     top_p: float = 1.0
     gpu_memory_utilization: float = 0.85
     wandb_project: str = "cs336-sft"
-    wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_mode: str = "online"
 
@@ -214,7 +213,6 @@ def sft_microbatch_train_step(
 def run_sft(config: SFTConfig) -> None:
     wandb.init(
         project=config.wandb_project,
-        entity=config.wandb_entity,
         name=config.wandb_run_name,
         mode=config.wandb_mode,
         config={k: v for k, v in vars(config).items()},
@@ -410,7 +408,6 @@ def main(
     gpu_memory_utilization: float = typer.Option(0.85, help="vLLM GPU memory utilization."),
     
     wandb_project: str = typer.Option("cs336-sft", help="wandb project name."),
-    wandb_entity: str | None = typer.Option(None, help="wandb entity/team."),
     wandb_run_name: str | None = typer.Option(None, help="wandb run name."),
     wandb_mode: str = typer.Option("online", help="wandb mode."),
 ) -> None:
@@ -438,7 +435,6 @@ def main(
         top_p=top_p,
         gpu_memory_utilization=gpu_memory_utilization,
         wandb_project=wandb_project,
-        wandb_entity=wandb_entity,
         wandb_run_name=wandb_run_name,
         wandb_mode=wandb_mode,
     )
