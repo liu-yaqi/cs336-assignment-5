@@ -6,7 +6,7 @@ from typing import Any, Callable, List, Tuple, Dict
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from vllm import LLM, SamplingParams
 
