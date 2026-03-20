@@ -24,7 +24,8 @@ from cs336_alignment.utils import (
     load_math_dataset_and_format,
     load_policy_into_vllm_instance,
     tokenize_prompt_and_output,
-    init_log_and_output_dir
+    init_log_and_output_dir,
+    _unwrap_policy_model
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -92,12 +93,6 @@ def apply_wandb_sweep_overrides(config: EIConfig) -> EIConfig:
         if key in config_field_names:
             setattr(config, key, value)
     return config
-
-
-def _unwrap_policy_model(model: torch.nn.Module) -> torch.nn.Module:
-    # torch.compile wraps the original model and prefixes state_dict keys with _orig_mod.
-    # vLLM expects the original key names, so always sync/save with the unwrapped module.
-    return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
 class PromptResponseDataset(Dataset):
@@ -317,6 +312,7 @@ def run_expert_iteration(config: EIConfig) -> None:
         config.validate()
         set_seed(config.seed)
 
+        run_name = config.wandb_run_name or "default"
         log, output_path = init_log_and_output_dir(config.output_dir, config.wandb_run_name)
         
         log(config)
@@ -441,7 +437,7 @@ def run_expert_iteration(config: EIConfig) -> None:
                     }
                 )
 
-            checkpoint_dir = output_path / f"{config.wandb_run_name}"
+            checkpoint_dir = output_path / f"{run_name}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             _unwrap_policy_model(model).save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)

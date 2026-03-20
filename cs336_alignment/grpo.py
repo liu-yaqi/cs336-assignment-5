@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 import torch
 import typer
 import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from vllm import LLM, SamplingParams
+from cs336_alignment.config_utils import (
+    apply_cli_overrides_to_dataclass,
+    load_dataclass_config_from_yaml,
+)
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.grpo_helper import (
@@ -25,7 +29,14 @@ from cs336_alignment.utils import (
     get_response_log_probs,
     evaluate_vllm, 
     load_policy_into_vllm_instance,
-    load_math_dataset_and_format)
+    load_math_dataset_and_format,
+    init_log_and_output_dir, 
+    _unwrap_policy_model,
+    get_eval_example_count)
+
+
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 DEFAULT_LOSS_TYPE: Literal[
     "no_baseline",
@@ -36,7 +47,7 @@ DEFAULT_LOSS_TYPE: Literal[
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
-DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "test.jsonl")
+DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "grpo_checkpoints")
 
 
@@ -58,6 +69,7 @@ class GRPOConfig:
     sampling_max_tokens: int = 1024
     epochs_per_rollout_batch: int = 1
     train_batch_size: int = 256
+    micro_old_log_prob_batch_size: int = 4
     gradient_accumulation_steps: int = 128
     gpu_memory_utilization: float = 0.85
     loss_type: Literal[
@@ -69,11 +81,13 @@ class GRPOConfig:
     seed: int = 69
     eval_every: int = 5
     n_eval_examples: int = 2048
+    n_first_eval_examples: int = 1024
     top_p: float = 1.0
     cliprange: float = 0.2
     wandb_project: str = "cs336-grpo"
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
+    use_torch_compile: bool = False
 
     @property
     def micro_train_batch_size(self) -> int:
@@ -126,16 +140,19 @@ def apply_wandb_sweep_overrides(config: GRPOConfig) -> GRPOConfig:
     return config
 
 
+def load_config_from_yaml(config_path: str) -> GRPOConfig:
+    return load_dataclass_config_from_yaml(config_path, GRPOConfig)
+
+
 def sample_question_batch(
-    prompts: list[str],
-    ground_truths: list[str],
+    data: list[dict[str, str]],
     n_prompts_per_rollout_batch: int,
 ) -> tuple[list[str], list[str]]:
     ## todo
-    batch_size = min(n_prompts_per_rollout_batch, len(prompts))
-    indices = random.sample(range(len(prompts)), batch_size)
-    batch_prompts = [prompts[index] for index in indices]
-    batch_ground_truths = [ground_truths[index] for index in indices]
+    batch_size = min(n_prompts_per_rollout_batch, len(data))
+    indices = random.sample(range(len(data)), batch_size)
+    batch_prompts = [data[index]["prompt"] for index in indices]
+    batch_ground_truths = [data[index]["expected_answer"] for index in indices]
     return batch_prompts, batch_ground_truths
 
 
@@ -172,7 +189,7 @@ def build_rollout_batch(
     return repeated_prompts, rollout_responses, repeated_ground_truths
 
 
-def compute_old_log_probs_in_microbatches(
+def compute_old_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
@@ -181,7 +198,7 @@ def compute_old_log_probs_in_microbatches(
 ) -> torch.Tensor:
     old_log_prob_chunks: list[torch.Tensor] = []
     batch_size = input_ids.shape[0]
-
+    model.eval()
     with torch.no_grad():
         for start in range(0, batch_size, micro_batch_size):
             end = start + micro_batch_size
@@ -191,8 +208,9 @@ def compute_old_log_probs_in_microbatches(
                 labels=labels[start:end].to(device_train),
                 return_token_entropy=False,
             )["log_probs"]
-            old_log_prob_chunks.append(old_log_probs.detach().cpu())
-
+            old_log_prob_chunks.append(old_log_probs) # todo:没有移出gpu
+    torch.cuda.empty_cache()
+    model.train()
     return torch.cat(old_log_prob_chunks, dim=0)
 
 
@@ -200,13 +218,19 @@ def iter_microbatches(
     batch_tensors: dict[str, torch.Tensor],
     micro_batch_size: int,
 ):
-    batch_size = batch_tensors["input_ids"].shape[0]
-    indices = torch.randperm(batch_size)
+    rollout_batch_size = batch_tensors["input_ids"].shape[0]
+    # indices = torch.randperm(rollout_batch_size)
 
-    for start in range(0, batch_size, micro_batch_size):
-        batch_indices = indices[start : start + micro_batch_size]
+    # for start in range(0, batch_size, micro_batch_size):
+    #     batch_indices = indices[start : start + micro_batch_size]
+    #     microbatch = {
+    #         key: value[batch_indices]
+    #         for key, value in batch_tensors.items()
+    #     }
+    #     yield microbatch
+    for start in range(0, rollout_batch_size, micro_batch_size):
         microbatch = {
-            key: value[batch_indices]
+            key: value[start : start + micro_batch_size]
             for key, value in batch_tensors.items()
         }
         yield microbatch
@@ -225,13 +249,14 @@ def train_on_rollout_batch(
     device_train: str,
     grpo_step: int,
     num_train_steps_per_rollout: int,
+    log,
 ) -> dict[str, float]:
     model.train()
 
-    last_loss = 0.0
     last_clip_fraction = 0.0
     total_loss = 0.0
-    n_optimizer_step = 0
+    total_entropy = 0.0
+    train_step = 0
 
     optimizer.zero_grad()
 
@@ -239,10 +264,9 @@ def train_on_rollout_batch(
         microbatches = iter_microbatches(rollout_batch, micro_batch_size)
         n_microbatches = (rollout_batch["input_ids"].shape[0] + micro_batch_size - 1) // micro_batch_size
         step_loss = 0.0
-        step_entropy = 0.0
         step_response_entropy = 0.0
 
-        for microbatch_index, microbatch in enumerate(microbatches, start=1):
+        for micro_ind, microbatch in enumerate(microbatches, start=1):
             input_ids = microbatch["input_ids"].to(device_train)
             labels = microbatch["labels"].to(device_train)
             response_mask = microbatch["response_mask"].to(device_train)
@@ -250,14 +274,19 @@ def train_on_rollout_batch(
             raw_rewards = microbatch["raw_rewards"].to(device_train)
             old_log_probs = None
             if loss_type == "grpo_clip":
-                old_log_probs = microbatch["old_log_probs"].to(device_train).detach()
+                old_log_probs = microbatch["old_log_probs"] # already on gpu
 
-            scored = get_response_log_probs(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=True,
-            )
+            with torch.autocast(device_type=device_train, dtype=torch.bfloat16):
+                scored = get_response_log_probs(
+                    model=model,
+                    input_ids=input_ids,
+                    labels=labels,
+                    return_token_entropy=True,
+                )
+            if "token_entropy" in scored:
+                scored["token_entropy"] = masked_mean(scored["token_entropy"], response_mask, dim=None)
+                response_entropy = scored["token_entropy"]/ gradient_accumulation_steps
+                step_response_entropy += float(response_entropy)
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=scored["log_probs"],
@@ -269,27 +298,19 @@ def train_on_rollout_batch(
                 old_log_probs=old_log_probs,
                 cliprange=cliprange,
             )
-
-            response_entropy = (
-                masked_mean(scored["token_entropy"], response_mask).detach().cpu().item()
-                / gradient_accumulation_steps
-            )
-            entropy = scored["token_entropy"].mean().detach().cpu().item() / gradient_accumulation_steps
             step_loss += float(loss.detach().cpu())
-            step_entropy += entropy
-            step_response_entropy += response_entropy
 
-            last_loss = float(loss.detach().cpu())
             clip_fraction_tensor = metadata.get("clip_fraction", None)
             if clip_fraction_tensor is None:
                 last_clip_fraction = 0.0
             else:
                 last_clip_fraction = float(clip_fraction_tensor.float().mean().detach().cpu().item())
 
-            should_step = microbatch_index % gradient_accumulation_steps == 0
-            is_last = microbatch_index == n_microbatches
+            if micro_ind % gradient_accumulation_steps == 0 or micro_ind == n_microbatches:
+                train_step += 1
+                total_loss += step_loss
+                total_entropy += step_response_entropy
 
-            if should_step or is_last:
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     .detach()
@@ -299,33 +320,32 @@ def train_on_rollout_batch(
                 optimizer.step()
                 optimizer.zero_grad()
 
-                n_optimizer_step += 1
-                total_loss += step_loss
-                print(
-                    f"[train step {n_optimizer_step}] "
-                    f"overall train step {grpo_step * num_train_steps_per_rollout + n_optimizer_step} "
+                log(
+                    f"rollout grpo_step {grpo_step} "
+                    f"epoch {epoch + 1} "
+                    f"step {train_step}] "
                     f"loss={step_loss:.6f} "
-                    f"last_loss={last_loss:.6f} avg_response_entropy={step_response_entropy:.6f} "
-                    f"avg_entropy={step_entropy:.6f}"
+                    f"avg_response_entropy={step_response_entropy:.6f} "
+                    f"last_clip_fraction={last_clip_fraction:.4f} "
                 )
                 wandb.log(
                     {
-                        "train/step": grpo_step * num_train_steps_per_rollout + n_optimizer_step,
-                        "train/rollout_epoch": epoch + 1,
-                        "train/roll_step_loss": step_loss,
-                        "train/roll_step_grad_norm": grad_norm,
-                        "train/roll_step_token_entropy": step_entropy,
-                        "train/roll_step_response_entropy": step_response_entropy,
-                        "train/roll_step_clip_fraction": last_clip_fraction,
+                        "rollout/step": grpo_step * num_train_steps_per_rollout + train_step,
+                        "rollout/epoch": epoch + 1,
+                        "rollout/grpostep": grpo_step,
+                        "rollout/step_loss": step_loss,
+                        "rollout/step_grad_norm": grad_norm,
+                        "rollout/step_response_entropy": step_response_entropy,
+                        "rollout/step_clip_fraction": last_clip_fraction,
                     }
                 )
                 step_loss = 0.0
-                step_entropy = 0.0
                 step_response_entropy = 0.0
 
     return {
-        "loss": total_loss / max(n_optimizer_step, 1),
+        "loss": total_loss / max(train_step, 1),
         "clip_fraction": last_clip_fraction,
+        "entropy": total_entropy / max(train_step, 1),
     }
 
 
@@ -339,9 +359,10 @@ def evaluate_model(
     top_p: float,
     n_eval_examples: int,
 ) -> dict[str, Any]:
-    load_policy_into_vllm_instance(model, vllm_model)
+    load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
     # eval_count = min(n_eval_examples, len(test_prompts))
     # todo
+    test_data = random.sample(test_data, min(n_eval_examples, len(test_data)))
     eval_sampling_params = SamplingParams(
         temperature=sampling_temperature,
         top_p=top_p,
@@ -364,20 +385,24 @@ def run_grpo(config: GRPOConfig) -> None:
         project=config.wandb_project,
         name=config.wandb_run_name,
         mode=config.wandb_mode,
-        config={k: v for k, v in vars(config).items()},
+        config=asdict(config),
     )
     config = apply_wandb_sweep_overrides(config)
     config.validate()
     set_seed(config.seed)
 
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_name = config.wandb_run_name or "default"
+    log, output_path = init_log_and_output_dir(config.output_dir, run_name)
+
+    log(config)
+    output_path = Path(output_path) # 存log和模型
+    output_path.mkdir(parents=True, exist_ok=True)
+    log(f"Artifacts/logs will be saved under: {output_path}")
 
     train_data = load_math_dataset_and_format(config.train_data_path)
     test_data = load_math_dataset_and_format(config.test_data_path)
-    train_prompts = [item["prompt"] for item in train_data]
-    train_ground_truths = [item["expected_answer"] for item in train_data]
-
+    log(f"Number of training examples: {len(train_data)}")
+    log(f"Number of test examples: {len(test_data)}")
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_path,
@@ -385,6 +410,8 @@ def run_grpo(config: GRPOConfig) -> None:
         attn_implementation="flash_attention_2",
         device_map=config.device_train,
     )
+    if config.use_torch_compile:
+        model = torch.compile(model)
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
 
     if tokenizer.pad_token_id is None:
@@ -404,42 +431,20 @@ def run_grpo(config: GRPOConfig) -> None:
         gpu_memory_utilization=config.gpu_memory_utilization,
     )
 
-    initial_eval = evaluate_model(
-        model=model,
-        vllm_model=vllm_model,
-        test_data=test_data,
-        sampling_min_tokens=config.sampling_min_tokens,
-        sampling_max_tokens=config.sampling_max_tokens,
-        sampling_temperature=config.sampling_temperature,
-        top_p=config.top_p,
-        n_eval_examples=config.n_eval_examples,
-    )
-    print(f"[step 0] accuracy={initial_eval['accuracy']:.4f}")
-    wandb.log(
-        {
-            "eval/step": 0,
-            "eval/accuracy": initial_eval["accuracy"],
-            "eval/format_rate": initial_eval["format_rate"],
-            "eval/avg_length": initial_eval["avg_length"],
-        },
-        step=0,
-    )
-
     for grpo_step in range(1, config.n_grpo_steps + 1):
-        print(f"\n{'=' * 50}")
-        print(f"[GRPO Step {grpo_step}/{config.n_grpo_steps}]")
 
-        prompt_batch, ground_truth_batch = sample_question_batch(
-            prompts=train_prompts,
-            ground_truths=train_ground_truths,
-            n_prompts_per_rollout_batch=config.n_prompts_per_rollout_batch,
-        )
+        # sample a batch of prompts for this rollout
+        batch_size = min(config.n_prompts_per_rollout_batch, len(train_data))
+        indices = random.sample(range(len(train_data)), batch_size)
+        batch_prompts = [train_data[index]["prompt"] for index in indices]
+        batch_ground_truths = [train_data[index]["expected_answer"] for index in indices]
 
-        load_policy_into_vllm_instance(model, vllm_model)
+        # compute rewards and advantages for the batch, and tokenize the rollout outputs for training
+        load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
         repeated_prompts, rollout_responses, repeated_ground_truths = build_rollout_batch(
             vllm_model=vllm_model,
-            prompts=prompt_batch,
-            ground_truths=ground_truth_batch,
+            prompts=batch_prompts,
+            ground_truths=batch_ground_truths,
             group_size=config.group_size,
             sampling_min_tokens=config.sampling_min_tokens,
             sampling_max_tokens=config.sampling_max_tokens,
@@ -465,17 +470,17 @@ def run_grpo(config: GRPOConfig) -> None:
             "input_ids": tokenized["input_ids"],
             "labels": tokenized["labels"],
             "response_mask": tokenized["response_mask"],
-            "advantages": advantages.float(),
-            "raw_rewards": raw_rewards.float(),
+            "advantages": advantages.float().unsqueeze(1),
+            "raw_rewards": raw_rewards.float().unsqueeze(1),
         }
 
         if config.loss_type == "grpo_clip":
-            rollout_batch["old_log_probs"] = compute_old_log_probs_in_microbatches(
+            rollout_batch["old_log_probs"] = compute_old_log_probs(
                 model=model,
                 input_ids=tokenized["input_ids"],
                 labels=tokenized["labels"],
                 device_train=config.device_train,
-                micro_batch_size=config.micro_train_batch_size,
+                micro_batch_size=config.micro_old_log_prob_batch_size,
             )
             assert rollout_batch["input_ids"].shape[0] == config.rollout_batch_size, (
                 "rollout batch tensor size must equal rollout_batch_size"
@@ -494,34 +499,38 @@ def run_grpo(config: GRPOConfig) -> None:
             device_train=config.device_train,
             grpo_step=grpo_step,
             num_train_steps_per_rollout=config.num_train_steps_per_rollout,
+            log=log,
         )
 
-        checkpoint_dir = output_dir / f"{config.wandb_run_name}"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(checkpoint_dir)
-        tokenizer.save_pretrained(checkpoint_dir)
-
-        print(
-            f"[train_step {grpo_step}] "
+        log(
+            f"[grpo step {grpo_step}] "
             f"total_rewards={reward_metadata['total_rewards']:.4f} "
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"loss={train_metrics['loss']:.6f} "
-            f"clip_fraction={train_metrics['clip_fraction']:.4f}"
+            f"clip_fraction={train_metrics['clip_fraction']:.4f} "
+            f"entropy={train_metrics['entropy']:.4f}"
         )
         wandb.log(
             {
-                "train/grop_step": grpo_step,
+                "train/grpo_step": grpo_step,
                 "train/total_rewards": reward_metadata["total_rewards"],
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/loss": train_metrics["loss"],
                 "train/clip_fraction": train_metrics["clip_fraction"],
+                "train/entropy": train_metrics["entropy"],
             },
             step=grpo_step,
         )
 
-        if grpo_step % config.eval_every == 0:
+        if grpo_step % config.eval_every == 0 or grpo_step == config.n_grpo_steps:
+            eval_example_count = get_eval_example_count(
+                grpo_step=grpo_step,
+                n_grpo_steps=config.n_grpo_steps,
+                final_n_eval_examples=config.n_eval_examples,
+                first_n_eval_examples=config.n_first_eval_examples,
+            )
             eval_result = evaluate_model(
                 model=model,
                 vllm_model=vllm_model,
@@ -530,10 +539,11 @@ def run_grpo(config: GRPOConfig) -> None:
                 sampling_max_tokens=config.sampling_max_tokens,
                 sampling_temperature=config.sampling_temperature,
                 top_p=config.top_p,
-                n_eval_examples=config.n_eval_examples,
+                n_eval_examples=eval_example_count,
             )
-            print(
-                f"[eval {grpo_step}] "
+            log(
+                f"[===eval step {grpo_step}] "
+                f"n_eval={eval_example_count} "
                 f"accuracy={eval_result['accuracy']:.4f} "
                 f"format_rate={eval_result['format_rate']:.4f}"
                 f"avg_length={eval_result['avg_length']:.2f} "
@@ -550,72 +560,36 @@ def run_grpo(config: GRPOConfig) -> None:
                 step=grpo_step,
             )
 
+            checkpoint_dir = output_path / f"f{run_name}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+
     wandb.finish()
 
 
 def main(
-    train_data_path: str = typer.Option(DEFAULT_TRAIN_DATA_PATH, help="Path to GRPO training data."),
-    test_data_path: str = typer.Option(DEFAULT_TEST_DATA_PATH, help="Path to validation data."),
-    model_path: str = typer.Option(DEFAULT_MODEL_PATH, help="Policy checkpoint or HF model path."),
-    output_dir: str = typer.Option(DEFAULT_OUTPUT_DIR, help="Directory for step checkpoints."),
-    device_train: str = typer.Option("cuda:0", help="Device used for policy training."),
-    device_vllm: str = typer.Option("cuda:1", help="Device used for vLLM rollouts/eval."),
-    n_grpo_steps: int = typer.Option(200, help="Number of rollout/update iterations."),
-    learning_rate: float = typer.Option(1e-5, help="AdamW learning rate."),
-    advantage_eps: float = typer.Option(1e-6, help="Epsilon used in reward normalization."),
-    rollout_batch_size: int = typer.Option(256, help="Number of sampled completions per rollout batch."),
-    group_size: int = typer.Option(8, help="Number of completions sampled per prompt."),
-    sampling_temperature: float = typer.Option(1.0, help="Sampling temperature for rollouts/eval."),
-    sampling_min_tokens: int = typer.Option(4, help="Minimum number of generated tokens."),
-    sampling_max_tokens: int = typer.Option(1024, help="Maximum number of generated tokens."),
-    epochs_per_rollout_batch: int = typer.Option(1, help="Gradient epochs per rollout batch."),
-    train_batch_size: int = typer.Option(256, help="Number of rollout samples consumed per optimizer step."),
-    gradient_accumulation_steps: int = typer.Option(128, help="Number of accumulation steps per optimizer step."),
-    gpu_memory_utilization: float = typer.Option(0.85, help="vLLM GPU memory utilization target."),
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = typer.Option(
-        DEFAULT_LOSS_TYPE,
-        help="Policy gradient loss to optimize.",
+    config_path: str = typer.Option(
+        "configs/grpo.yaml",
+        help="Path to GRPO YAML config file.",
     ),
-    use_std_normalization: bool = typer.Option(True, help="Normalize group advantages by group std."),
-    seed: int = typer.Option(69, help="Random seed."),
-    eval_every: int = typer.Option(5, help="Run validation every N training steps."),
-    n_eval_examples: int = typer.Option(1024, help="Number of validation examples to evaluate."),
-    top_p: float = typer.Option(1.0, help="Top-p used for rollouts/eval."),
-    cliprange: float = typer.Option(0.2, help="Clip range used only for grpo_clip."),
-    wandb_project: str = typer.Option("cs336-grpo", help="wandb project name."),
-    wandb_run_name: Optional[str] = typer.Option(None, help="wandb run name."),
-    wandb_mode: str = typer.Option("online", help="wandb mode."),
+    wandb_project: Optional[str] = typer.Option("cs336-grpo", help="wandb project name."),
+    wandb_run_name: Optional[str] = typer.Option(None, help="Optional override for wandb run name."),
+    wandb_mode: Optional[str] = typer.Option("online", help="Optional override for wandb mode."),
+    set_values: List[str] = typer.Option(
+        [],
+        "--set",
+        help="Override config values from CLI, e.g. --set learning_rate=3e-6 --set n_grpo_steps=50",
+    ),
 ) -> None:
-    config = GRPOConfig(
-        train_data_path=train_data_path,
-        test_data_path=test_data_path,
-        model_path=model_path,
-        output_dir=output_dir,
-        device_train=device_train,
-        device_vllm=device_vllm,
-        n_grpo_steps=n_grpo_steps,
-        learning_rate=learning_rate,
-        advantage_eps=advantage_eps,
-        rollout_batch_size=rollout_batch_size,
-        group_size=group_size,
-        sampling_temperature=sampling_temperature,
-        sampling_min_tokens=sampling_min_tokens,
-        sampling_max_tokens=sampling_max_tokens,
-        epochs_per_rollout_batch=epochs_per_rollout_batch,
-        train_batch_size=train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        gpu_memory_utilization=gpu_memory_utilization,
-        loss_type=loss_type,
-        use_std_normalization=use_std_normalization,
-        seed=seed,
-        eval_every=eval_every,
-        n_eval_examples=n_eval_examples,
-        top_p=top_p,
-        cliprange=cliprange,
-        wandb_project=wandb_project,
-        wandb_run_name=wandb_run_name,
-        wandb_mode=wandb_mode,
-    )
+    config = load_config_from_yaml(config_path)
+    config = apply_cli_overrides_to_dataclass(config, set_values)
+    if wandb_project is not None:
+        config.wandb_project = wandb_project
+    if wandb_run_name is not None:
+        config.wandb_run_name = wandb_run_name
+    if wandb_mode is not None:
+        config.wandb_mode = wandb_mode
     run_grpo(config)
 
 

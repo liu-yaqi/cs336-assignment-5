@@ -162,6 +162,7 @@ def get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
+    only_return_mean_response_entropy: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Get the conditional log-probs of the response given the prompt,
         and optionally the entropy of the next token predictions.
@@ -200,7 +201,6 @@ def get_response_log_probs(
 
     if return_token_entropy:
         result["token_entropy"] = compute_entropy(logits)
-
     return result
 
 
@@ -257,6 +257,12 @@ def load_policy_into_vllm_instance(policy: torch.nn.Module, llm:LLM):
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+
+
+def _unwrap_policy_model(model: torch.nn.Module) -> torch.nn.Module:
+    # torch.compile wraps the original model and prefixes state_dict keys with _orig_mod.
+    # vLLM expects the original key names, so always sync/save with the unwrapped module.
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
 def evaluate_vllm(
@@ -346,6 +352,22 @@ def evaluate_vllm(
         return metrics, results
     else:
         return metrics
+
+
+def get_eval_example_count(
+    grpo_step: int,
+    n_grpo_steps: int,
+    final_n_eval_examples: int,
+    first_n_eval_examples: int = 1024
+) -> int:
+    # Use a smaller eval set in early/mid training to save time, then switch
+    # to the full configured eval size in the final 20% of training.
+    warmup_eval_examples = min(first_n_eval_examples, final_n_eval_examples)
+    ramp_start_step = max(1, int(0.8 * n_grpo_steps))
+    if grpo_step < ramp_start_step:
+        return warmup_eval_examples
+    return final_n_eval_examples
+
 
 # ----------------------------- Logging Utility ---------------------------
 from datetime import datetime

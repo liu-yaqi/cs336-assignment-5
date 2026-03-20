@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,9 +24,12 @@ from cs336_alignment.utils import (
     tokenize_prompt_and_output,
     evaluate_vllm,
     load_math_dataset_and_format,
-    init_log_and_output_dir
+    init_log_and_output_dir,
+    _unwrap_policy_model
 )
 
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
@@ -68,6 +72,7 @@ class SFTConfig:
     beta2: float = 0.95
     normalize_constant: float = 1.0
     eval_every: int = 16
+    async_eval: bool = True
     num_eval_examples: int = 1024
     log_generation_examples: int = 8
     max_tokens: int = 1024
@@ -102,7 +107,7 @@ def build_sft_dataloader(
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int,
     shuffle: bool = True,
-    num_workers: int = 4,
+    num_workers: int = 8,
     pin_memory: bool = True,
     add_eos_to_response: bool = False,
 ) -> DataLoader:
@@ -214,6 +219,21 @@ def sft_microbatch_train_step(
     return loss, metadata
 
 
+def _run_eval_on_vllm(
+    vllm_model: LLM,
+    prompts: list[str],
+    ground_truths: list[str],
+    sampling_params: SamplingParams,
+) -> dict[str, Any]:
+    return evaluate_vllm(
+        vllm_model=vllm_model,
+        reward_fn=r1_zero_reward_fn,
+        prompts=prompts,
+        ground_truths=ground_truths,
+        eval_sampling_params=sampling_params,
+    )
+
+
 def run_sft(config: SFTConfig) -> None:
     wandb.init(
         project=config.wandb_project,
@@ -280,8 +300,38 @@ def run_sft(config: SFTConfig) -> None:
     optimizer.zero_grad()
     model.train()
     train_iterator = cycle_dataloader(train_loader)
+    eval_executor = ThreadPoolExecutor(max_workers=1) if config.async_eval else None
+    eval_future: Optional[Future] = None
+    eval_future_step: Optional[int] = None
+
+    def maybe_flush_eval_result() -> None:
+        nonlocal eval_future, eval_future_step
+        if eval_future is None or not eval_future.done():
+            return
+        metrics = eval_future.result()
+        assert eval_future_step is not None
+        log(
+            f"[eval step {eval_future_step}] accuracy={metrics['accuracy']:.4f} "
+            f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
+        )
+        wandb.log(
+            {
+                "eval/step": eval_future_step,
+                "eval/accuracy": metrics["accuracy"],
+                "eval/format_rate": metrics["format_rate"],
+                "eval/avg_length": metrics["avg_length"],
+                "eval/avg_correct_length": metrics["avg_correct_length"],
+                "eval/avg_incorrect_length": metrics["avg_incorrect_length"],
+                "eval/correct": metrics["correct"],
+                "eval/total": metrics["total"],
+            },
+            step=eval_future_step,
+        )
+        eval_future = None
+        eval_future_step = None
 
     for step in range(1, config.n_sft_steps + 1):
+        maybe_flush_eval_result()
         step_loss = 0.0
         step_entropy = 0.0
         step_response_entropy = 0.0
@@ -291,7 +341,8 @@ def run_sft(config: SFTConfig) -> None:
             input_ids = batch["input_ids"].to(config.device_train)
             labels = batch["labels"].to(config.device_train)
             response_mask = batch["response_mask"].to(config.device_train)
-            # If sequence is long, split the current micro-batch into two halves to reduce peak memory.
+
+            # 解决cuda out of memory问题: If sequence is long, split the current micro-batch into two halves to reduce peak memory.
             split_chunks = [(input_ids, labels, response_mask)]
             if input_ids.shape[1] > 1024 and input_ids.shape[0] > 1:
                 half = input_ids.shape[0] // 2
@@ -299,10 +350,10 @@ def run_sft(config: SFTConfig) -> None:
                     (input_ids[:half], labels[:half], response_mask[:half]),
                     (input_ids[half:], labels[half:], response_mask[half:]),
                 ]
-
             split_factor = len(split_chunks)
             grad_scale = config.gradient_accumulation_steps * split_factor
             for chunk_input_ids, chunk_labels, chunk_response_mask in split_chunks:
+                
                 with torch.autocast(device_type=config.device_train, dtype=torch.bfloat16):
                     scored = get_response_log_probs(
                         model=model,
@@ -342,61 +393,91 @@ def run_sft(config: SFTConfig) -> None:
         )
 
         if step % config.eval_every == 0 or step == config.n_sft_steps:
-            load_policy_into_vllm_instance(model, vllm_model)
-            test_data = random.sample(test_data, min(config.num_eval_examples, len(test_data)))
-            metrics = evaluate_vllm(
-                vllm_model=vllm_model,
-                reward_fn=r1_zero_reward_fn,
-                prompts=[item["prompt"] for item in test_data],
-                ground_truths=[item["expected_answer"] for item in test_data],
-                eval_sampling_params=sampling_params,
-            )
+            eval_data = random.sample(test_data, min(config.num_eval_examples, len(test_data)))
+            eval_prompts = [item["prompt"] for item in eval_data]
+            eval_ground_truths = [item["expected_answer"] for item in eval_data]
 
-            log(
-                f"[eval step {step}] accuracy={metrics['accuracy']:.4f} "
-                f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
-            )
-            wandb.log(
-                {
-                    "eval/step": step,
-                    "eval/accuracy": metrics["accuracy"],
-                    "eval/format_rate": metrics["format_rate"],
-                    "eval/avg_length": metrics["avg_length"],
-                    "eval/avg_correct_length": metrics["avg_correct_length"],
-                    "eval/avg_incorrect_length": metrics["avg_incorrect_length"],
-                    "eval/correct": metrics["correct"],
-                    "eval/total": metrics["total"],
-                },
-                step=step,
-            )
+            if config.async_eval:
+                if eval_future is not None and not eval_future.done():
+                    log(f"[eval step {step}] waiting for previous async eval to finish")
+                    eval_future.result()
+                    maybe_flush_eval_result()
 
-            generation_log = log_generations(
-                model=model,
-                tokenizer=tokenizer,
-                vllm_model=vllm_model,
-                sampling_params=sampling_params,
-                data = log_test_data, 
-                device_train=config.device_train
-            )
-
-            for example_index, example in enumerate(generation_log["examples"], start=1):
-                log(f"[generation {example_index}] prompt={example['prompt']}/n")
-                log(f"[generation {example_index}] response={example['model_output']}/n")
-                log(f"[generation {example_index}] ground_truth={example['ground_truth']}/n")
-                log(f"[generation {example_index}] reward={example['reward']}/n")
-                log(
-                    f"[generation {example_index}] avg_token_entropy="
-                    f"{example['avg_token_entropy']:.4f} avg_response_entropy="
-                    f"{example['avg_response_entropy']:.4f} response_length="
-                    f"{example['response_length']:.0f}"
+                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                eval_future = eval_executor.submit(
+                    _run_eval_on_vllm,
+                    vllm_model,
+                    eval_prompts,
+                    eval_ground_truths,
+                    sampling_params,
                 )
-                log(f"generation examples acc {generation_log['metrics']['accuracy']:.4f} format_rate {generation_log['metrics']['format_rate']:.4f} avg_length {generation_log['metrics']['avg_length']:.1f}")
+                eval_future_step = step
+                log(f"[eval step {step}] async eval submitted")
+            else:
+                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                metrics = _run_eval_on_vllm(
+                    vllm_model=vllm_model,
+                    prompts=eval_prompts,
+                    ground_truths=eval_ground_truths,
+                    sampling_params=sampling_params,
+                )
 
-            checkpoint_dir = output_path / f"f{config.wandb_run_name}"
+                log(
+                    f"[eval step {step}] accuracy={metrics['accuracy']:.4f} "
+                    f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
+                )
+                wandb.log(
+                    {
+                        "eval/step": step,
+                        "eval/accuracy": metrics["accuracy"],
+                        "eval/format_rate": metrics["format_rate"],
+                        "eval/avg_length": metrics["avg_length"],
+                        "eval/avg_correct_length": metrics["avg_correct_length"],
+                        "eval/avg_incorrect_length": metrics["avg_incorrect_length"],
+                        "eval/correct": metrics["correct"],
+                        "eval/total": metrics["total"],
+                    },
+                    step=step,
+                )
+
+                generation_log = log_generations(
+                    model=model,
+                    tokenizer=tokenizer,
+                    vllm_model=vllm_model,
+                    sampling_params=sampling_params,
+                    data=log_test_data,
+                    device_train=config.device_train,
+                )
+
+                for example_index, example in enumerate(generation_log["examples"], start=1):
+                    log(f"[generation {example_index}] prompt={example['prompt']}/n")
+                    log(f"[generation {example_index}] response={example['model_output']}/n")
+                    log(f"[generation {example_index}] ground_truth={example['ground_truth']}/n")
+                    log(f"[generation {example_index}] reward={example['reward']}/n")
+                    log(
+                        f"[generation {example_index}] avg_token_entropy="
+                        f"{example['avg_token_entropy']:.4f} avg_response_entropy="
+                        f"{example['avg_response_entropy']:.4f} response_length="
+                        f"{example['response_length']:.0f}"
+                    )
+                    log(
+                        f"generation examples acc {generation_log['metrics']['accuracy']:.4f} "
+                        f"format_rate {generation_log['metrics']['format_rate']:.4f} "
+                        f"avg_length {generation_log['metrics']['avg_length']:.1f}"
+                    )
+
+            checkpoint_dir = output_path / f"f{run_name}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)
     
+    if eval_future is not None:
+        log("waiting for final async eval to finish...")
+        eval_future.result()
+        maybe_flush_eval_result()
+    if eval_executor is not None:
+        eval_executor.shutdown(wait=True)
+
     log("train okkk")
 
     wandb.finish()
@@ -421,13 +502,14 @@ def main(
     normalize_constant: float = typer.Option(1.0, help="Loss normalization constant."),
 
     eval_every: int = typer.Option(16, help="Run validation every N optimizer steps."),
+    async_eval: bool = typer.Option(True, help="Run vLLM eval asynchronously on device_vllm."),
     num_eval_examples: int = typer.Option(1024, help="Validation examples per eval."),
     log_generation_examples: int = typer.Option(8, help="Examples to log with generation."),
     max_tokens: int = typer.Option(1024, help="Generation max tokens."),
     temperature: float = typer.Option(1.0, help="Generation temperature."),
     top_p: float = typer.Option(1.0, help="Generation top-p."),
     gpu_memory_utilization: float = typer.Option(0.85, help="vLLM GPU memory utilization."),
-    use_torch_compile: bool = typer.Option(False, help="Enable torch.compile for the policy model."),
+    use_torch_compile: bool = typer.Option(True, help="Enable torch.compile for the policy model."),
     
     wandb_project: str = typer.Option("cs336-sft", help="wandb project name."),
     wandb_run_name: Optional[str] = typer.Option(None, help="wandb run name."),
@@ -450,6 +532,7 @@ def main(
         beta2=beta2,
         normalize_constant=normalize_constant,
         eval_every=eval_every,
+        async_eval=async_eval,
         num_eval_examples=num_eval_examples,
         log_generation_examples=log_generation_examples,
         max_tokens=max_tokens,
