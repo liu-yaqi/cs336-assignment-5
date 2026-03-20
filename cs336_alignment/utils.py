@@ -2,8 +2,9 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, List, Tuple, Dict
+from typing import Any, Callable, List, Tuple, Dict, Optional
 
+from unittest.mock import patch
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import PreTrainedTokenizerBase
@@ -27,11 +28,14 @@ def load_math_dataset(data_path: str) -> list[dict[str, Any]]:
     Returns:
         List of MATH examples
     """
-    examples = []
+    # examples = []
+    # with open(data_path, "r") as f:
+    #     for line in f:
+    #         examples.append(json.loads(line))
+    # return examples
     with open(data_path, "r") as f:
-        for line in f:
-            examples.append(json.loads(line))
-    return examples
+        data = json.load(f)
+    return data
 
 
 def format_r1_zero_prompt(problem: str) -> str:
@@ -50,19 +54,21 @@ def format_r1_zero_prompt(problem: str) -> str:
 
 
 def load_math_dataset_and_format(data_path: str) -> List[Dict[str, Any]]:
-    examples = []
     with open(data_path, "r") as f:
-        for line in f:
-            sample = json.loads(line)
-            sample['prompt'] = format_r1_zero_prompt(sample['problem'])
-            examples.append(sample)
-    return examples
+        examples = json.load(f)
+
+    formatted_examples = []
+    for sample in examples:
+        sample['prompt'] = format_r1_zero_prompt(sample['problem'])
+        formatted_examples.append(sample)
+    return formatted_examples
 
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
     tokenizer: PreTrainedTokenizerBase,
+    max_seq_len: Optional[int] = None,
 ) -> dict[str, torch.Tensor]:
     """Tokenize the prompt and output strings, and construct a mask that is 1
     for the response tokens and 0 for other tokens (prompt or padding).
@@ -81,10 +87,20 @@ def tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    batch_size = len(prompt_strs)
-    # 批量分词（无填充、无截断）
-    prompt_enc = tokenizer(prompt_strs, padding=False, truncation=False)
-    output_enc = tokenizer(output_strs, padding=False, truncation=False)
+    # 批量分词。若设置了 max_seq_len，先在 tokenizer 侧做基础截断，避免极端长样本。
+    use_truncation = max_seq_len is not None
+    prompt_enc = tokenizer(
+        prompt_strs,
+        padding=False,
+        truncation=use_truncation,
+        max_length=max_seq_len,
+    )
+    output_enc = tokenizer(
+        output_strs,
+        padding=False,
+        truncation=use_truncation,
+        max_length=max_seq_len,
+    )
 
     # 将每个样本的 token IDs 转为 1D 张量
     prompt_ids = [torch.tensor(ids, dtype=torch.long) for ids in prompt_enc["input_ids"]]
@@ -231,7 +247,9 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
             device=device,
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization
+
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=2048,
         )
 
 
@@ -328,3 +346,44 @@ def evaluate_vllm(
         return metrics, results
     else:
         return metrics
+
+# ----------------------------- Logging Utility ---------------------------
+from datetime import datetime
+import os
+import time
+class Log:
+    def __init__(self, log_path, time_key=True):
+        self.path = log_path
+        if time_key:
+            self.path = self.path.replace(
+                ".", "{}.".format(time.strftime("_%Y%m%d%H%M%S", time.localtime(time.time())))
+            )
+        print(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
+            file=open(self.path, "a+"),
+        )
+        print("log path:", self.path)
+        print("****************开始记录*********************", file=open(self.path, "a+"))
+
+    def __call__(self, *content):
+        t1 = time.strftime("%H:%M:%S", time.localtime(time.time()))
+        print(*content)
+        print(t1, content, file=open(self.path, "a+"))
+
+    def clean(self):
+        print(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
+            file=open(self.path, "w"),
+        )
+        print("****************开始记录*********************", file=open(self.path, "a+"))
+
+
+def init_log_and_output_dir(output_dir, model_name):
+    now = datetime.now()
+    current_time_name = now.strftime("%m-%d-%H-%M-%S") + "-" + model_name
+
+    if not os.path.exists(f"{output_dir}/{current_time_name}"):
+        os.makedirs(f"{output_dir}/{current_time_name}")
+    output_dir = f"{output_dir}/{current_time_name}"
+    log = Log(f"{output_dir}/logs.txt")
+    return log, output_dir

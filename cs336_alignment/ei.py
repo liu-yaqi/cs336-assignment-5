@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +24,7 @@ from cs336_alignment.utils import (
     load_math_dataset_and_format,
     load_policy_into_vllm_instance,
     tokenize_prompt_and_output,
+    init_log_and_output_dir
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -48,7 +49,7 @@ class EIConfig:
     sft_epochs: int = 2
     micro_batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
     eval_every_ei_steps: int = 1
     num_eval_examples: int = 1024
@@ -78,18 +79,6 @@ class EIConfig:
         assert self.eval_every_ei_steps > 0, "eval_every_ei_steps must be positive"
 
 
-class PromptResponseDataset(Dataset):
-    def __init__(self, samples: list[dict[str, str]]) -> None:
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> tuple[str, str]:
-        sample = self.samples[idx]
-        return sample["prompt"], sample["response"]
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -103,6 +92,24 @@ def apply_wandb_sweep_overrides(config: EIConfig) -> EIConfig:
         if key in config_field_names:
             setattr(config, key, value)
     return config
+
+
+def _unwrap_policy_model(model: torch.nn.Module) -> torch.nn.Module:
+    # torch.compile wraps the original model and prefixes state_dict keys with _orig_mod.
+    # vLLM expects the original key names, so always sync/save with the unwrapped module.
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+class PromptResponseDataset(Dataset):
+    def __init__(self, samples: list[dict[str, str]]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[str, str]:
+        sample = self.samples[idx]
+        return sample["prompt"], sample["response"]
 
 
 def build_filtered_dataloader(
@@ -172,10 +179,6 @@ def rollout_and_filter(
         "correct_rollouts": float(correct_rollouts),
         "filter_rate": filter_rate,
     }
-    print(
-        f"  Rollout stats: {correct_rollouts}/{total_rollouts} correct "
-        f"({filter_rate * 100:.1f}%)"
-    )
     return filtered_samples, rollout_stats
 
 
@@ -185,6 +188,7 @@ def sft_on_filtered_data(
     optimizer: torch.optim.Optimizer,
     filtered_samples: list[dict[str, str]],
     config: EIConfig,
+    log: callable,
     ei_step: int,
     optimize_step: int = 0,
 ) -> dict[str, float]:
@@ -198,6 +202,7 @@ def sft_on_filtered_data(
     model.train()
 
     denom = config.micro_batch_size * config.gradient_accumulation_steps
+    # todo: 改成epoch训练，目前是按照step训练，会有点点问题
     n_sft_steps = max(1, math.ceil((len(filtered_samples) * config.sft_epochs) / denom))
 
     last_loss = 0.0
@@ -213,29 +218,42 @@ def sft_on_filtered_data(
             labels = batch["labels"].to(config.device_train)
             response_mask = batch["response_mask"].to(config.device_train)
 
-            scored = get_response_log_probs(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=True,
-            )
-            loss, _ = sft_microbatch_train_step(
-                policy_log_probs=scored["log_probs"],
-                response_mask=response_mask,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
-                normalize_constant=1.0,
-            )
-            response_entropy = (
-                scored["token_entropy"][response_mask].mean().detach().cpu().item()
-                / config.gradient_accumulation_steps
-            )
-            entropy = (
-                scored["token_entropy"].mean().detach().cpu().item()
-                / config.gradient_accumulation_steps
-            )
-            step_loss += float(loss.detach().cpu())
-            step_entropy += entropy
-            step_response_entropy += response_entropy
+            # !!解决cudaoutofmemory If sequence length is too long, split the micro-batch into two halves to lower peak memory.
+            split_chunks = [(input_ids, labels, response_mask)]
+            if input_ids.shape[1] > 1024 and input_ids.shape[0] > 1:
+                half = input_ids.shape[0] // 2
+                split_chunks = [
+                    (input_ids[:half], labels[:half], response_mask[:half]),
+                    (input_ids[half:], labels[half:], response_mask[half:]),
+                ]
+
+            split_factor = len(split_chunks)
+            grad_scale = config.gradient_accumulation_steps * split_factor
+            for chunk_input_ids, chunk_labels, chunk_response_mask in split_chunks:
+                with torch.autocast(device_type=config.device_train, dtype=torch.bfloat16):
+                    scored = get_response_log_probs(
+                        model=model,
+                        input_ids=chunk_input_ids,
+                        labels=chunk_labels,
+                        return_token_entropy=True,
+                    )
+                loss, _ = sft_microbatch_train_step(
+                    policy_log_probs=scored["log_probs"],
+                    response_mask=chunk_response_mask,
+                    gradient_accumulation_steps=grad_scale,
+                    normalize_constant=1.0,
+                )
+                response_entropy = (
+                    scored["token_entropy"][chunk_response_mask].mean().detach().cpu().item()
+                    / grad_scale
+                )
+                entropy = (
+                    scored["token_entropy"].mean().detach().cpu().item()
+                    / grad_scale
+                )
+                step_loss += float(loss.detach().cpu())
+                step_entropy += entropy
+                step_response_entropy += response_entropy
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -244,7 +262,7 @@ def sft_on_filtered_data(
         last_loss = step_loss
         total_loss += step_loss
 
-        print(
+        log(
             f"[ei {ei_step} sft {step} step {optimize_step}] loss={step_loss:.6f} "
             f"avg_response_entropy={step_response_entropy:.6f} avg_entropy={step_entropy:.6f}"
         )
@@ -262,7 +280,7 @@ def sft_on_filtered_data(
         "sft_last_loss": last_loss,
         "sft_steps": float(n_sft_steps),
         "sft_total_loss": total_loss // max(1, n_sft_steps),
-    }
+    }, optimize_step
 
 
 def evaluate_model(
@@ -270,7 +288,7 @@ def evaluate_model(
     test_data: list[dict[str, Any]],
     config: EIConfig,
 ) -> dict[str, Any]:
-    # eval_data = random.sample(test_data, min(config.num_eval_examples, len(test_data)))
+    test_data = random.sample(test_data, min(config.num_eval_examples, len(test_data)))
     eval_sampling_params = SamplingParams(
         temperature=config.temperature,
         top_p=config.top_p,
@@ -292,134 +310,147 @@ def run_expert_iteration(config: EIConfig) -> None:
         project=config.wandb_project,
         name=config.wandb_run_name,
         mode=config.wandb_mode,
-        config={k: v for k, v in vars(config).items()},
+        config=asdict(config),
     )
-    config = apply_wandb_sweep_overrides(config)
-    config.validate()
-    set_seed(config.seed)
+    try:
+        config = apply_wandb_sweep_overrides(config)
+        config.validate()
+        set_seed(config.seed)
 
-    print(config)
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        log, output_path = init_log_and_output_dir(config.output_dir, config.wandb_run_name)
+        
+        log(config)
+        output_path = Path(output_path) # 存log和模型
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map=config.device_train,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if model.config.pad_token_id is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map=config.device_train,
+        )
+        model = torch.compile(model)
+        tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        unwrapped_model = _unwrap_policy_model(model)
+        if unwrapped_model.config.pad_token_id is None:
+            unwrapped_model.config.pad_token_id = tokenizer.pad_token_id
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
 
-    vllm_model = init_vllm(
-        model_id=config.model_path,
-        device=config.device_vllm,
-        seed=config.seed,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-    )
+        vllm_model = init_vllm(
+            model_id=config.model_path,
+            device=config.device_vllm,
+            seed=config.seed,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+        )
 
-    train_data = load_math_dataset_and_format(config.train_data_path)
-    test_data = load_math_dataset_and_format(config.test_data_path)
+        train_data = load_math_dataset_and_format(config.train_data_path)
+        test_data = load_math_dataset_and_format(config.test_data_path)
 
-    load_policy_into_vllm_instance(model, vllm_model)
-    initial_metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
-    print(
-        f"[eval 0] accuracy={initial_metrics['accuracy']:.4f} "
-        f"format_rate={initial_metrics['format_rate']:.4f} avg_length={initial_metrics['avg_length']:.1f}"
-    )
-    wandb.log(
-        {
-            "eval/ei_step": 0,
-            "eval/accuracy": initial_metrics["accuracy"],
-            "eval/format_rate": initial_metrics["format_rate"],
-            "eval/avg_length": initial_metrics["avg_length"],
-        }
-    )
-
-    optimize_step = 0
-    for ei_step in range(1, config.n_ei_steps + 1):
-        print(f"\n{'=' * 50}")
-        print(f"[EI Step {ei_step}/{config.n_ei_steps}]")
-
-        n_prompts = min(config.n_prompts_per_rollout_batch, len(train_data))
-        prompt_indices = random.sample(range(len(train_data)), n_prompts)
-        rollout_prompts =  [train_data[idx]["prompt"] for idx in prompt_indices]
-        rollout_ground_truths = [train_data[idx]["expected_answer"] for idx in prompt_indices]
-
-        load_policy_into_vllm_instance(model, vllm_model)
-        filtered_samples, rollout_stats = rollout_and_filter(
-            vllm_model=vllm_model,
-            prompts=rollout_prompts,
-            ground_truths=rollout_ground_truths,
-            config=config,
+        load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+        initial_metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
+        log(
+            f"[eval 0] accuracy={initial_metrics['accuracy']:.4f} "
+            f"format_rate={initial_metrics['format_rate']:.4f} avg_length={initial_metrics['avg_length']:.1f}"
         )
         wandb.log(
             {
-                "rollout/ei_step": ei_step,
-                "rollout/correct_rollouts": rollout_stats["correct_rollouts"],
-                "rollout/filter_rate": rollout_stats["filter_rate"],
-                "rollout/filtered_samples": float(len(filtered_samples)),
+                "eval/ei_step": 0,
+                "eval/accuracy": initial_metrics["accuracy"],
+                "eval/format_rate": initial_metrics["format_rate"],
+                "eval/avg_length": initial_metrics["avg_length"],
             }
         )
 
-        if len(filtered_samples) == 0:
-            print("  No correct rollouts, skipping SFT for this EI step.")
-            continue
+        optimize_step = 0
+        for ei_step in range(1, config.n_ei_steps + 1):
+            log(f"\n{'=' * 50}")
+            log(f"[EI Step {ei_step}/{config.n_ei_steps}]")
 
-        sft_stats = sft_on_filtered_data(
-            model=model,
-            tokenizer=tokenizer,
-            optimizer=optimizer,
-            filtered_samples=filtered_samples,
-            config=config,
-            ei_step=ei_step,
-            optimize_step=optimize_step
-        )
-        wandb.log(
-            {
-                "sft/ei_step": ei_step,
-                "sft/last_loss": sft_stats["sft_last_loss"],
-                "sft/total_loss": sft_stats["sft_total_loss"],
-                "sft/steps": sft_stats["sft_steps"],
-            }
-        )
+            n_prompts = min(config.n_prompts_per_rollout_batch, len(train_data))
+            prompt_indices = random.sample(range(len(train_data)), n_prompts)
+            rollout_prompts =  [train_data[idx]["prompt"] for idx in prompt_indices]
+            rollout_ground_truths = [train_data[idx]["expected_answer"] for idx in prompt_indices]
 
-        if ei_step % config.eval_every_ei_steps == 0:
-            load_policy_into_vllm_instance(model, vllm_model)
-            metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
-            print(
-                f"[eval {ei_step}] accuracy={metrics['accuracy']:.4f} "
-                f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
+            load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+            filtered_samples, rollout_stats = rollout_and_filter(
+                vllm_model=vllm_model,
+                prompts=rollout_prompts,
+                ground_truths=rollout_ground_truths,
+                config=config,
+            )
+            log(
+                f"ei_step{ei_step}  Rollout stats: {rollout_stats['correct_rollouts']}/{rollout_stats['total_rollouts']} correct "
+                f"({rollout_stats['filter_rate'] * 100:.1f}%)"
             )
             wandb.log(
                 {
-                    "eval/ei_step": ei_step,
-                    "eval/accuracy": metrics["accuracy"],
-                    "eval/format_rate": metrics["format_rate"],
-                    "eval/avg_length": metrics["avg_length"],
-                    "eval/avg_correct_length": metrics["avg_correct_length"],
-                    "eval/avg_incorrect_length": metrics["avg_incorrect_length"],
-                    "eval/correct": metrics["correct"],
-                    "eval/total": metrics["total"],
+                    "rollout/ei_step": ei_step,
+                    "rollout/correct_rollouts": rollout_stats["correct_rollouts"],
+                    "rollout/filter_rate": rollout_stats["filter_rate"],
+                    "rollout/filtered_samples": float(len(filtered_samples)),
                 }
             )
 
-        checkpoint_dir = output_dir / f"{config.wandb_run_name}"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(checkpoint_dir)
-        tokenizer.save_pretrained(checkpoint_dir)
+            if len(filtered_samples) == 0:
+                log("  No correct rollouts, skipping SFT for this EI step.")
+                continue
 
-    print("\nExpert Iteration complete.")
-    wandb.finish()
+            sft_stats, optimize_step = sft_on_filtered_data(
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                filtered_samples=filtered_samples,
+                config=config,
+                ei_step=ei_step,
+                optimize_step=optimize_step,
+                log=log
+            )
+            wandb.log(
+                {
+                    "sft/ei_step": ei_step,
+                    "sft/last_loss": sft_stats["sft_last_loss"],
+                    "sft/total_loss": sft_stats["sft_total_loss"],
+                    "sft/steps": sft_stats["sft_steps"],
+                }
+            )
+
+            if ei_step % config.eval_every_ei_steps == 0 or ei_step == config.n_ei_steps:
+                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
+                log(
+                    f"[eval {ei_step}] accuracy={metrics['accuracy']:.4f} "
+                    f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
+                )
+                wandb.log(
+                    {
+                        "eval/ei_step": ei_step,
+                        "eval/accuracy": metrics["accuracy"],
+                        "eval/format_rate": metrics["format_rate"],
+                        "eval/avg_length": metrics["avg_length"],
+                        "eval/avg_correct_length": metrics["avg_correct_length"],
+                        "eval/avg_incorrect_length": metrics["avg_incorrect_length"],
+                        "eval/correct": metrics["correct"],
+                        "eval/total": metrics["total"],
+                    }
+                )
+
+            checkpoint_dir = output_path / f"{config.wandb_run_name}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            _unwrap_policy_model(model).save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+
+        log("\nExpert Iteration complete.")
+    finally:
+        wandb.finish()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def main(

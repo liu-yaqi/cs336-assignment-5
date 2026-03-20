@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,7 +22,8 @@ from cs336_alignment.utils import (
     masked_normalize,
     tokenize_prompt_and_output,
     evaluate_vllm,
-    load_math_dataset_and_format
+    load_math_dataset_and_format,
+    init_log_and_output_dir
 )
 
 
@@ -61,7 +62,7 @@ class SFTConfig:
     n_sft_steps: int = 256
     micro_batch_size: int = 8
     gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.95
@@ -73,6 +74,7 @@ class SFTConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     gpu_memory_utilization: float = 0.85
+    use_torch_compile: bool = False
     wandb_project: str = "cs336-sft"
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
@@ -81,7 +83,6 @@ class SFTConfig:
         assert self.micro_batch_size > 0, "micro_batch_size must be positive"
         assert self.gradient_accumulation_steps > 0, "gradient_accumulation_steps must be positive"
         assert self.n_sft_steps > 0, "n_sft_steps must be positive"
-
 
 
 class PromptResponseDataset(Dataset):
@@ -176,8 +177,10 @@ def log_generations(
                         labels=labels,
                         return_token_entropy=True,
                     )
+    torch.cuda.empty_cache()
     model.train()
-    entropy = scored['token_entropy'].cpu()
+    entropy = scored['token_entropy'].detach().cpu()
+    response_mask = response_mask.detach().cpu()
     for i in range(len(entropy)):
         results[i]["avg_token_entropy"] = entropy[i].mean().item()
         results[i]["avg_response_entropy"] = entropy[i, response_mask[i]].mean().item()
@@ -216,14 +219,17 @@ def run_sft(config: SFTConfig) -> None:
         project=config.wandb_project,
         name=config.wandb_run_name,
         mode=config.wandb_mode,
-        config={k: v for k, v in vars(config).items()},
+        config=asdict(config),
     )
     config = apply_wandb_sweep_overrides(config)
     config.validate()
     set_seed(config.seed)
 
-    print(config)
-    output_path = Path(config.output_dir) # 存log和模型
+    run_name = config.wandb_run_name or "default"
+    log, output_path = init_log_and_output_dir(config.output_dir, run_name)
+
+    log(config)
+    output_path = Path(output_path) # 存log和模型
     output_path.mkdir(parents=True, exist_ok=True)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -232,6 +238,10 @@ def run_sft(config: SFTConfig) -> None:
         attn_implementation="flash_attention_2",
         device_map=config.device_train,
     )
+    # model.gradient_checkpointing_enable()
+    # model.config.use_cache = False
+    if config.use_torch_compile:
+        model = torch.compile(model)
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
 
     vllm_model = init_vllm(
@@ -265,6 +275,8 @@ def run_sft(config: SFTConfig) -> None:
     test_data = load_math_dataset_and_format(config.test_data_path)
     log_test_data = random.sample(test_data, min(config.log_generation_examples, len(test_data)))
 
+    log("Load data okkkk")
+
     optimizer.zero_grad()
     model.train()
     train_iterator = cycle_dataloader(train_loader)
@@ -279,30 +291,43 @@ def run_sft(config: SFTConfig) -> None:
             input_ids = batch["input_ids"].to(config.device_train)
             labels = batch["labels"].to(config.device_train)
             response_mask = batch["response_mask"].to(config.device_train)
+            # If sequence is long, split the current micro-batch into two halves to reduce peak memory.
+            split_chunks = [(input_ids, labels, response_mask)]
+            if input_ids.shape[1] > 1024 and input_ids.shape[0] > 1:
+                half = input_ids.shape[0] // 2
+                split_chunks = [
+                    (input_ids[:half], labels[:half], response_mask[:half]),
+                    (input_ids[half:], labels[half:], response_mask[half:]),
+                ]
 
-            scored = get_response_log_probs(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=True,
-            )
-            loss, _ = sft_microbatch_train_step(
-                policy_log_probs=scored["log_probs"],
-                response_mask=response_mask,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
-                normalize_constant=config.normalize_constant,
-            )
-            response_entropy = scored["token_entropy"][response_mask].mean().detach().cpu().item() / config.gradient_accumulation_steps
-            entropy = scored["token_entropy"].mean().detach().cpu().item() / config.gradient_accumulation_steps
-            step_loss += float(loss.detach().cpu())
-            step_entropy += entropy
-            step_response_entropy += response_entropy
+            split_factor = len(split_chunks)
+            grad_scale = config.gradient_accumulation_steps * split_factor
+            for chunk_input_ids, chunk_labels, chunk_response_mask in split_chunks:
+                with torch.autocast(device_type=config.device_train, dtype=torch.bfloat16):
+                    scored = get_response_log_probs(
+                        model=model,
+                        input_ids=chunk_input_ids,
+                        labels=chunk_labels,
+                        return_token_entropy=True,
+                    )
+                loss, _ = sft_microbatch_train_step(
+                    policy_log_probs=scored["log_probs"],
+                    response_mask=chunk_response_mask,
+                    gradient_accumulation_steps=grad_scale,
+                    normalize_constant=config.normalize_constant,
+                )
+
+                response_entropy = scored["token_entropy"][chunk_response_mask].mean().detach().cpu().item() / grad_scale
+                entropy = scored["token_entropy"].mean().detach().cpu().item() / grad_scale
+                step_loss += float(loss.detach().cpu())
+                step_entropy += entropy
+                step_response_entropy += response_entropy
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
-        print(
+        log(
             f"[step {step}] loss={step_loss:.6f} avg_response_entropy="
             f"{step_response_entropy:.6f} avg_entropy={step_entropy:.6f}"
         )
@@ -316,8 +341,9 @@ def run_sft(config: SFTConfig) -> None:
             step=step,
         )
 
-        if step % config.eval_every == 0:
+        if step % config.eval_every == 0 or step == config.n_sft_steps:
             load_policy_into_vllm_instance(model, vllm_model)
+            test_data = random.sample(test_data, min(config.num_eval_examples, len(test_data)))
             metrics = evaluate_vllm(
                 vllm_model=vllm_model,
                 reward_fn=r1_zero_reward_fn,
@@ -326,7 +352,7 @@ def run_sft(config: SFTConfig) -> None:
                 eval_sampling_params=sampling_params,
             )
 
-            print(
+            log(
                 f"[eval step {step}] accuracy={metrics['accuracy']:.4f} "
                 f"format_rate={metrics['format_rate']:.4f} avg_length={metrics['avg_length']:.1f}"
             )
@@ -354,30 +380,24 @@ def run_sft(config: SFTConfig) -> None:
             )
 
             for example_index, example in enumerate(generation_log["examples"], start=1):
-                print(f"[generation {example_index}] prompt={example['prompt']}")
-                print(f"[generation {example_index}] response={example['model_output']}")
-                print(f"[generation {example_index}] ground_truth={example['ground_truth']}")
-                print(f"[generation {example_index}] reward={example['reward']}")
-                print(
+                log(f"[generation {example_index}] prompt={example['prompt']}/n")
+                log(f"[generation {example_index}] response={example['model_output']}/n")
+                log(f"[generation {example_index}] ground_truth={example['ground_truth']}/n")
+                log(f"[generation {example_index}] reward={example['reward']}/n")
+                log(
                     f"[generation {example_index}] avg_token_entropy="
                     f"{example['avg_token_entropy']:.4f} avg_response_entropy="
                     f"{example['avg_response_entropy']:.4f} response_length="
                     f"{example['response_length']:.0f}"
                 )
-
-            wandb.log(
-                {
-                    "eval_examples/accuracy": generation_log["metrics"]["accuracy"],
-                    "eval_examples/format_rate": generation_log["metrics"]["format_rate"],
-                    "eval_examples/avg_length": generation_log["metrics"]["avg_length"],
-                },
-                step=step,
-            )
+                log(f"generation examples acc {generation_log['metrics']['accuracy']:.4f} format_rate {generation_log['metrics']['format_rate']:.4f} avg_length {generation_log['metrics']['avg_length']:.1f}")
 
             checkpoint_dir = output_path / f"f{config.wandb_run_name}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)
+    
+    log("train okkk")
 
     wandb.finish()
 
@@ -407,6 +427,7 @@ def main(
     temperature: float = typer.Option(1.0, help="Generation temperature."),
     top_p: float = typer.Option(1.0, help="Generation top-p."),
     gpu_memory_utilization: float = typer.Option(0.85, help="vLLM GPU memory utilization."),
+    use_torch_compile: bool = typer.Option(False, help="Enable torch.compile for the policy model."),
     
     wandb_project: str = typer.Option("cs336-sft", help="wandb project name."),
     wandb_run_name: Optional[str] = typer.Option(None, help="wandb run name."),
@@ -435,6 +456,7 @@ def main(
         temperature=temperature,
         top_p=top_p,
         gpu_memory_utilization=gpu_memory_utilization,
+        use_torch_compile=use_torch_compile,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         wandb_mode=wandb_mode,
