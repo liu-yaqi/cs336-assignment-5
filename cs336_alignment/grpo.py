@@ -36,7 +36,9 @@ from cs336_alignment.utils import (
 
 
 import os
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
+
 
 DEFAULT_LOSS_TYPE: Literal[
     "no_baseline",
@@ -87,7 +89,7 @@ class GRPOConfig:
     wandb_project: str = "cs336-grpo"
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
-    use_torch_compile: bool = False
+    use_torch_compile: bool = True
 
     @property
     def micro_train_batch_size(self) -> int:
@@ -165,6 +167,7 @@ def build_rollout_batch(
     sampling_max_tokens: int,
     sampling_temperature: float,
     top_p: float,
+    seed: int,
 ) -> tuple[list[str], list[str], list[str]]:
     sampling_params = SamplingParams(
         n=group_size,
@@ -174,6 +177,7 @@ def build_rollout_batch(
         min_tokens=sampling_min_tokens,
         stop=["</answer>"],
         include_stop_str_in_output=True,
+        seed=seed,
     )
     outputs = vllm_model.generate(prompts, sampling_params)
 
@@ -358,6 +362,7 @@ def evaluate_model(
     sampling_temperature: float,
     top_p: float,
     n_eval_examples: int,
+    seed: int,
 ) -> dict[str, Any]:
     load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
     # eval_count = min(n_eval_examples, len(test_prompts))
@@ -369,6 +374,7 @@ def evaluate_model(
         max_tokens=sampling_max_tokens,
         min_tokens=sampling_min_tokens,
         stop=["</answer>"],
+        seed=seed,
         include_stop_str_in_output=True,
     )
     return evaluate_vllm(
@@ -450,6 +456,7 @@ def run_grpo(config: GRPOConfig) -> None:
             sampling_max_tokens=config.sampling_max_tokens,
             sampling_temperature=config.sampling_temperature,
             top_p=config.top_p,
+            seed=config.seed,
         )
 
         advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
@@ -525,6 +532,8 @@ def run_grpo(config: GRPOConfig) -> None:
         )
 
         if grpo_step % config.eval_every == 0 or grpo_step == config.n_grpo_steps:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             eval_example_count = get_eval_example_count(
                 grpo_step=grpo_step,
                 n_grpo_steps=config.n_grpo_steps,
@@ -540,6 +549,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 sampling_temperature=config.sampling_temperature,
                 top_p=config.top_p,
                 n_eval_examples=eval_example_count,
+                seed=config.seed,
             )
             log(
                 f"[===eval step {grpo_step}] "
@@ -560,10 +570,10 @@ def run_grpo(config: GRPOConfig) -> None:
                 step=grpo_step,
             )
 
-            checkpoint_dir = output_path / f"f{run_name}"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(checkpoint_dir)
-            tokenizer.save_pretrained(checkpoint_dir)
+            # checkpoint_dir = output_path / f"f{run_name}"
+            # checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # model.save_pretrained(checkpoint_dir)
+            # tokenizer.save_pretrained(checkpoint_dir)
 
     wandb.finish()
 
