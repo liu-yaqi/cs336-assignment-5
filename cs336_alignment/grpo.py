@@ -32,7 +32,9 @@ from cs336_alignment.utils import (
     load_policy_into_vllm_instance,
     load_math_dataset_and_format,
     init_log_and_output_dir,
-    get_eval_example_count)
+    get_eval_example_count,
+    masked_normalize
+    )
 
 
 import os
@@ -268,7 +270,10 @@ def train_on_rollout_batch(
         microbatches = iter_microbatches(rollout_batch, micro_batch_size)
         n_microbatches = (rollout_batch["input_ids"].shape[0] + micro_batch_size - 1) // micro_batch_size
         step_loss = 0.0
-        step_response_entropy = 0.0
+        clip_fraction_accum = 0.0
+        step_total_response_entropy = 0.0
+        step_total_response_tokens = 0.0
+
 
         for micro_ind, microbatch in enumerate(microbatches, start=1):
             input_ids = microbatch["input_ids"].to(device_train)
@@ -288,9 +293,9 @@ def train_on_rollout_batch(
                     return_token_entropy=True,
                 )
             if "token_entropy" in scored:
-                scored["token_entropy"] = masked_mean(scored["token_entropy"], response_mask, dim=None).detach().cpu()
-                response_entropy = scored["token_entropy"]/ gradient_accumulation_steps
-                step_response_entropy += float(response_entropy)
+                scored["token_entropy"] = masked_normalize(scored["token_entropy"], response_mask).detach()
+                step_total_response_entropy += float(scored["token_entropy"].cpu().item())
+                step_total_response_tokens += microbatch["response_mask"].sum().detach().cpu().item()
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=scored["log_probs"],
@@ -306,17 +311,12 @@ def train_on_rollout_batch(
             )
             step_loss += float(loss.detach().cpu())
 
-            clip_fraction_tensor = metadata.get("clip_fraction", None)
-            if clip_fraction_tensor is None:
-                last_clip_fraction = 0.0
-            else:
-                last_clip_fraction = float(clip_fraction_tensor.float().mean().detach().cpu().item())
+            clip_fraction_accum += metadata.get("clip_fraction", None)
+            if metadata.get("clip_fraction") is not None:
+                clip_fraction_accum += metadata["clip_fraction"].mean().detach().cpu().item() / gradient_accumulation_steps
 
+            #===========one train_batch: accumulate gradients and step the optimizer
             if micro_ind % gradient_accumulation_steps == 0 or micro_ind == n_microbatches:
-                train_step += 1
-                total_loss += step_loss
-                total_entropy += step_response_entropy
-
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     .detach()
@@ -326,13 +326,14 @@ def train_on_rollout_batch(
                 optimizer.step()
                 optimizer.zero_grad()
 
+                avg_response_entropy = step_total_response_entropy / step_total_response_tokens
                 log(
                     f"rollout grpo_step {grpo_step} "
                     f"epoch {epoch + 1} "
                     f"step {train_step}] "
                     f"loss={step_loss:.6f} "
-                    f"avg_response_entropy={step_response_entropy:.6f} "
-                    f"last_clip_fraction={last_clip_fraction:.4f} "
+                    f"avg_response_entropy={avg_response_entropy:.6f} "
+                    f"step_clip_fraction={clip_fraction_accum:.4f} "
                     f"grad_norm={grad_norm:.4f}"
                 )
                 wandb.log(
@@ -342,12 +343,22 @@ def train_on_rollout_batch(
                         "rollout/grpostep": grpo_step,
                         "rollout/step_loss": step_loss,
                         "rollout/step_grad_norm": grad_norm,
-                        "rollout/step_response_entropy": step_response_entropy,
-                        "rollout/step_clip_fraction": last_clip_fraction,
+                        "rollout/step_response_entropy": avg_response_entropy,
+                        "rollout/step_clip_fraction": clip_fraction_accum,
                     }
                 )
+
+                train_step += 1
+                total_loss += step_loss
+                total_entropy += avg_response_entropy
+                last_clip_fraction = clip_fraction_accum
+
                 step_loss = 0.0
-                step_response_entropy = 0.0
+                clip_fraction_accum = 0.0
+                step_total_response_entropy = 0.0
+                step_total_response_tokens = 0.0
+
+
 
     return {
         "loss": total_loss / max(train_step, 1),
@@ -380,13 +391,16 @@ def evaluate_model(
         seed=seed,
         include_stop_str_in_output=True,
     )
-    return evaluate_vllm(
+    metrics, results = evaluate_vllm(
         vllm_model=vllm_model,
         reward_fn=r1_zero_reward_fn,
         prompts=[item["prompt"] for item in test_data],
         ground_truths=[item["expected_answer"] for item in test_data],
         eval_sampling_params=eval_sampling_params,
+        return_output_results=True,
     )
+    metrics["sample_outputs"] = results[:200]  # log up to 200 sample outputs
+    return metrics
 
 
 def run_grpo(config: GRPOConfig) -> None:
@@ -475,6 +489,9 @@ def run_grpo(config: GRPOConfig) -> None:
             output_strs=rollout_responses,
             tokenizer=tokenizer,
         )
+        log(
+            f"[grpo step {grpo_step}] rollout_input_ids_shape={tuple(tokenized['input_ids'].shape)}"
+        )
         rollout_batch = {
             "input_ids": tokenized["input_ids"],
             "labels": tokenized["labels"],
@@ -519,8 +536,8 @@ def run_grpo(config: GRPOConfig) -> None:
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"loss={train_metrics['loss']:.6f} "
-            f"clip_fraction={train_metrics['clip_fraction']:.4f} "
             f"entropy={train_metrics['entropy']:.4f}"
+            f"clip_fraction={train_metrics['clip_fraction']:.4f} "
         )
         wandb.log(
             {
@@ -529,8 +546,8 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/loss": train_metrics["loss"],
-                "train/clip_fraction": train_metrics["clip_fraction"],
                 "train/entropy": train_metrics["entropy"],
+                "train/clip_fraction": train_metrics["clip_fraction"],
             },
             step=grpo_step,
         )
@@ -555,6 +572,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 n_eval_examples=eval_example_count,
                 seed=config.seed,
             )
+            #-----------------eval log mtrics---------------
             log(
                 f"[===eval step {grpo_step}] "
                 f"n_eval={eval_example_count} "
@@ -573,6 +591,36 @@ def run_grpo(config: GRPOConfig) -> None:
                 },
                 step=grpo_step,
             )
+            #-----------------eval log some sample outputs---------------
+            sample_outputs = eval_result.get("sample_outputs", [])
+            if sample_outputs:
+                sorted_by_reward = sorted(sample_outputs, key=lambda x: x.get("reward", 0.0))
+                selected_indices = {
+                    0,
+                    len(sorted_by_reward) // 4,
+                    len(sorted_by_reward) // 2,
+                    (3 * len(sorted_by_reward)) // 4,
+                    len(sorted_by_reward) - 1,
+                }
+                selected_outputs = [
+                    sorted_by_reward[i]
+                    for i in sorted(selected_indices)
+                    if 0 <= i < len(sorted_by_reward)
+                ]
+                selected_outputs = selected_outputs[:5]
+
+                for idx, sample in enumerate(selected_outputs, start=1):
+                    prompt_preview = sample["prompt"].replace("\n", " ")[:200]
+                    output_preview = sample["model_output"].replace("\n", " ")[:400]
+                    log(
+                        f"[eval sample {idx}/5 step {grpo_step}] "
+                        f"reward={sample.get('reward', 0.0):.3f} "
+                        f"format_reward={sample.get('format_reward', 0.0):.3f} "
+                        f"answer_reward={sample.get('answer_reward', 0.0):.3f} "
+                        f"response_length={sample.get('response_length', 0)} "
+                        f"prompt='{prompt_preview}' "
+                        f"output='{output_preview}'"
+                    )
 
             # checkpoint_dir = output_path / f"f{run_name}"
             # checkpoint_dir.mkdir(parents=True, exist_ok=True)
