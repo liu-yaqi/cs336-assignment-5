@@ -25,7 +25,7 @@ from cs336_alignment.utils import (
     evaluate_vllm,
     load_math_dataset_and_format,
     init_log_and_output_dir,
-    _unwrap_policy_model
+    set_seed
 )
 
 import os
@@ -36,13 +36,6 @@ DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "sft_gpt-oss-120b.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "sft_checkpoints")
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def apply_wandb_sweep_overrides(config: SFTConfig) -> SFTConfig:

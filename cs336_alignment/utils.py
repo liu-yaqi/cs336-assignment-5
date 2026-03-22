@@ -410,3 +410,17 @@ def init_log_and_output_dir(output_dir, model_name):
     output_dir = f"{output_dir}/{current_time_name}"
     log = Log(f"{output_dir}/logs.txt")
     return log, output_dir
+
+import numpy as np
+import random
+import os
+def set_seed(seed):
+     os.environ['PYTHONHASHSEED'] = str(seed)
+     torch.manual_seed(seed)
+     np.random.seed(seed)
+     random.seed(seed)
+     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False

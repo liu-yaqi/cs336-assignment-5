@@ -25,7 +25,8 @@ from cs336_alignment.utils import (
     load_policy_into_vllm_instance,
     tokenize_prompt_and_output,
     init_log_and_output_dir,
-    _unwrap_policy_model
+    _unwrap_policy_model,
+    set_seed
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,13 +79,6 @@ class EIConfig:
         assert self.gradient_accumulation_steps > 0, "gradient_accumulation_steps must be positive"
         assert self.n_ei_steps > 0, "n_ei_steps must be positive"
         assert self.eval_every_ei_steps > 0, "eval_every_ei_steps must be positive"
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def apply_wandb_sweep_overrides(config: EIConfig) -> EIConfig:

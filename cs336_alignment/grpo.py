@@ -33,7 +33,8 @@ from cs336_alignment.utils import (
     load_math_dataset_and_format,
     init_log_and_output_dir,
     get_eval_example_count,
-    masked_normalize
+    masked_normalize,
+    set_seed
     )
 
 
@@ -124,14 +125,6 @@ class GRPOConfig:
             typer.echo(
                 "Warning: grpo_clip is typically most useful in the off-policy setting with multiple epochs."
             )
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def apply_wandb_sweep_overrides(config: GRPOConfig) -> GRPOConfig:
