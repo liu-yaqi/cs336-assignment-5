@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import numpy as np
 import time
+import gc
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -91,6 +92,7 @@ class GRPOConfig:
     use_gradient_checkpointing: bool = False
     use_torch_compile: bool = True
     enable_entropy: bool = True
+    prompt_format: Literal["r1_zero", "question_only"] = "r1_zero"
     norm_type: Literal["constant", "mean", "normalize"] = "mean"
     norm_constant: float = 1.0
 
@@ -123,6 +125,9 @@ class GRPOConfig:
         assert self.micro_train_batch_size > 0, "micro_train_batch_size must be positive"
         assert self.rollout_batch_size % self.micro_train_batch_size == 0, (
             "rollout_batch_size must be divisible by micro_train_batch_size"
+        )
+        assert self.prompt_format in {"r1_zero", "question_only"}, (
+            "prompt_format must be either 'r1_zero' or 'question_only'"
         )
         if self.loss_type == "grpo_clip" and self.epochs_per_rollout_batch == 1:
             typer.echo(
@@ -465,8 +470,8 @@ def run_grpo(config: GRPOConfig) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
     log(f"Artifacts/logs will be saved under: {output_path}")
 
-    train_data = load_math_dataset_and_format(config.train_data_path)
-    test_data = load_math_dataset_and_format(config.test_data_path)
+    train_data = load_math_dataset_and_format(config.train_data_path, config.prompt_format)
+    test_data = load_math_dataset_and_format(config.test_data_path, config.prompt_format)
     log(f"Number of training examples: {len(train_data)}")
     log(f"Number of test examples: {len(test_data)}")
 
@@ -620,7 +625,8 @@ def run_grpo(config: GRPOConfig) -> None:
         )
 
         if grpo_step % config.eval_every == 0 or grpo_step == config.n_grpo_steps:
-            if torch.cuda.is_available():
+            gc.collect()
+            with torch.cuda.device(config.device_train):
                 torch.cuda.empty_cache()
             eval_example_count = get_eval_example_count(
                 grpo_step=grpo_step,
