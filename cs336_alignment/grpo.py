@@ -41,8 +41,8 @@ from cs336_alignment.utils import (
 
 import os
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
-
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
+print(os.environ["PYTORCH_CUDA_ALLOC_CONF"] )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
@@ -90,6 +90,7 @@ class GRPOConfig:
     wandb_mode: str = "online"
     use_gradient_checkpointing: bool = False
     use_torch_compile: bool = True
+    enable_entropy: bool = True
     norm_type: Literal["constant", "mean", "normalize"] = "mean"
     norm_constant: float = 1.0
 
@@ -291,6 +292,7 @@ def train_on_rollout_batch(
     device_train: str,
     grpo_step: int,
     num_train_steps_per_rollout: int,
+    enable_entropy: bool,
     norm_type: Literal["constant", "mean", "normalize"],
     norm_constant: float,
     log,
@@ -328,9 +330,9 @@ def train_on_rollout_batch(
                     model=model,
                     input_ids=input_ids,
                     labels=labels,
-                    return_token_entropy=True,
+                    return_token_entropy=enable_entropy,
                 )
-            if "token_entropy" in scored:
+            if enable_entropy and "token_entropy" in scored:
                 scored["token_entropy"] = masked_normalize(scored["token_entropy"], response_mask).detach()
                 step_total_response_entropy += float(scored["token_entropy"].cpu().item())
             step_total_response_tokens += microbatch["response_mask"].sum().detach().cpu().item()
@@ -363,7 +365,9 @@ def train_on_rollout_batch(
                 optimizer.step()
                 optimizer.zero_grad()
 
-                avg_response_entropy = step_total_response_entropy / step_total_response_tokens
+                avg_response_entropy = 0.0
+                if enable_entropy and step_total_response_tokens > 0:
+                    avg_response_entropy = step_total_response_entropy / step_total_response_tokens
                 log(
                     f"rollout grpo_step {grpo_step} "
                     f"epoch {epoch + 1} "
@@ -454,6 +458,7 @@ def run_grpo(config: GRPOConfig) -> None:
 
     run_name = config.wandb_run_name or "default"
     log, output_path = init_log_and_output_dir(config.output_dir, run_name)
+    log(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF not set"))
 
     log(config)
     output_path = Path(output_path) # 存log和模型
@@ -573,12 +578,12 @@ def run_grpo(config: GRPOConfig) -> None:
             device_train=config.device_train,
             grpo_step=grpo_step,
             num_train_steps_per_rollout=config.num_train_steps_per_rollout,
+            enable_entropy=config.enable_entropy,
             norm_constant=config.norm_constant,
             log=log,
         )
         train_time_sec = time.perf_counter() - train_start_time
         train_gpu_stats = _get_gpu_memory_stats_mb(config.device_train)
-        vllm_gpu_stats = _get_gpu_memory_stats_mb(config.device_vllm)
 
         log(
             f"[grpo step {grpo_step}] "
@@ -672,8 +677,8 @@ def run_grpo(config: GRPOConfig) -> None:
                 selected_outputs = selected_outputs[:5]
 
                 for idx, sample in enumerate(selected_outputs, start=1):
-                    prompt_preview = sample["prompt"].replace("\n", " ")[:200]
-                    output_preview = sample["model_output"].replace("\n", " ")[:400]
+                    prompt_preview = sample["prompt"].replace("\n", " ")
+                    output_preview = sample["model_output"].replace("\n", " ")
                     log(
                         f"[eval sample {idx}/5 step {grpo_step}] "
                         f"reward={sample.get('reward', 0.0):.3f} "

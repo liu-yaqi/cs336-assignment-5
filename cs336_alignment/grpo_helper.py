@@ -61,7 +61,7 @@ def compute_group_normalized_rewards(
         'total_rewards': float(torch.mean(raw_rewards)),
         'format_rewards': sum(format_rewards) / len(format_rewards),
         'answer_rewards': sum(answer_rewards) / len(answer_rewards),
-        'normalized_rewards': float(torch.mean(normalized_rewards)),
+        'normalized_rewards': float(torch.mean(torch.abs(normalized_rewards))),
 
     }
 
