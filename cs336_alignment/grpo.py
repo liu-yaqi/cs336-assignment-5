@@ -534,6 +534,7 @@ def run_grpo(config: GRPOConfig) -> None:
             f"total_rewards={reward_metadata['total_rewards']:.4f} "
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
+            f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
             f"clip_fraction={train_metrics['clip_fraction']:.4f} "
@@ -544,6 +545,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/total_rewards": reward_metadata["total_rewards"],
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
+                "train/normalized_rewards": reward_metadata["normalized_rewards"],
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],
                 "train/clip_fraction": train_metrics["clip_fraction"],
