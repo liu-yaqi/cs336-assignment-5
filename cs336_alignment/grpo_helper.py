@@ -4,6 +4,7 @@ from typing import Any, Callable, Literal
 
 import torch
 from torch import Tensor
+from .utils import masked_normalize
 
 
 def compute_group_normalized_rewards(
@@ -92,6 +93,7 @@ def compute_grpo_clip_loss(
     policy_log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     cliprange: float,
+    is_clip: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the GRPO-Clip loss.
 
@@ -108,28 +110,18 @@ def compute_grpo_clip_loss(
         tuple[torch.Tensor, dict[str, torch.Tensor]]:
             the GRPO-Clip per-token loss and metadata.
     """
-    # # Expand advantages to match sequence length
-    # advantages = advantages.unsqueeze(-1)  # (batch_size, 1, 1)
-    # advantages = advantages.expand(-1, policy_log_probs.shape[1])  # (batch_size, seq_len)
-
-    # Compute the ratio: exp(new_log_prob - old_log_prob)
     ratio = torch.exp(policy_log_probs - old_log_probs)
-
-    # Compute the clipped ratio
-    ratio_clipped = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
-
-    # Compute the loss using the clipped ratio
-    # Loss = -min(ratio * advantage, clipped_ratio * advantage)
     v = ratio * advantages
-    v_clipped = ratio_clipped * advantages
 
-    # Take the minimum (for positive advantages, we want to clip from above;
-    # for negative advantages, we want to clip from below)
-    loss = -1 * torch.min(v, v_clipped) # batch_size, seq_len
+    if is_clip:
+        ratio_clipped = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+        v_clipped = ratio_clipped * advantages
 
-    metadata = {"clip_fraction": v > v_clipped}
-
-    return loss, metadata
+        return -torch.min(v, v_clipped), {
+            "clip_fraction": (v > v_clipped).float().mean()}
+    
+    else:
+        return -v, {"clip_fraction": 0.0}
 
 
 def compute_policy_gradient_loss(
@@ -162,7 +154,13 @@ def compute_policy_gradient_loss(
         loss = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
         return loss, {}
     elif loss_type == "grpo_clip": 
+        assert old_log_probs is not None
+        assert cliprange is not None
         return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    elif loss_type == "grpo_no_clip": 
+        assert old_log_probs is not None
+        assert cliprange is not None
+        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange, is_clip=False)
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
@@ -198,10 +196,13 @@ def grpo_microbatch_train_step(
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    norm_type: Literal["constant", "mean", "normalize"] = "mean",
     raw_rewards: torch.Tensor | None = None,
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    norm_constant: float | None = None,
+
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
@@ -235,12 +236,18 @@ def grpo_microbatch_train_step(
         old_log_probs=old_log_probs,
         cliprange=cliprange,
     )
+    if norm_type == "constant":
+        loss = masked_normalize(per_token_loss, response_mask, norm_constant, dim=-1)
 
-    # Apply response mask and sum
-    loss = masked_mean(per_token_loss, response_mask)
+    elif norm_type == "mean":
+        loss = masked_mean(per_token_loss, response_mask, dim=-1)
+    
+    elif norm_type == "normalize":
+        max_gen_len = response_mask.sum(dim=-1, keepdim=True).max().item()
+        loss = masked_normalize(per_token_loss, response_mask,dim=-1,normalize_constant=max_gen_len)
 
     # Scale by gradient accumulation
-    loss = loss / gradient_accumulation_steps
+    loss = loss.mean() / gradient_accumulation_steps
 
     # Compute gradients
     loss.backward()

@@ -304,7 +304,7 @@ def run_sft(config: SFTConfig) -> None:
     eval_future: Optional[Future] = None
     eval_future_step: Optional[int] = None
 
-    def maybe_flush_eval_result() -> None:
+    def maybe_flush_eval_result(current_step: int) -> None:
         nonlocal eval_future, eval_future_step
         if eval_future is None or not eval_future.done():
             return
@@ -317,6 +317,7 @@ def run_sft(config: SFTConfig) -> None:
         wandb.log(
             {
                 "eval/step": eval_future_step,
+                "eval/log_step": current_step,
                 "eval/accuracy": metrics["accuracy"],
                 "eval/format_rate": metrics["format_rate"],
                 "eval/avg_length": metrics["avg_length"],
@@ -325,13 +326,13 @@ def run_sft(config: SFTConfig) -> None:
                 "eval/correct": metrics["correct"],
                 "eval/total": metrics["total"],
             },
-            step=eval_future_step,
+            step=current_step,
         )
         eval_future = None
         eval_future_step = None
 
     for step in range(1, config.n_sft_steps + 1):
-        maybe_flush_eval_result()
+        maybe_flush_eval_result(step)
         step_loss = 0.0
         step_entropy = 0.0
         step_response_entropy = 0.0
@@ -401,9 +402,9 @@ def run_sft(config: SFTConfig) -> None:
                 if eval_future is not None and not eval_future.done():
                     log(f"[eval step {step}] waiting for previous async eval to finish")
                     eval_future.result()
-                    maybe_flush_eval_result()
+                    maybe_flush_eval_result(step)
 
-                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                load_policy_into_vllm_instance(model, vllm_model)
                 eval_future = eval_executor.submit(
                     _run_eval_on_vllm,
                     vllm_model,
@@ -414,7 +415,7 @@ def run_sft(config: SFTConfig) -> None:
                 eval_future_step = step
                 log(f"[eval step {step}] async eval submitted")
             else:
-                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                load_policy_into_vllm_instance(model, vllm_model)
                 metrics = _run_eval_on_vllm(
                     vllm_model=vllm_model,
                     prompts=eval_prompts,
@@ -474,7 +475,7 @@ def run_sft(config: SFTConfig) -> None:
     if eval_future is not None:
         log("waiting for final async eval to finish...")
         eval_future.result()
-        maybe_flush_eval_result()
+        maybe_flush_eval_result(config.n_sft_steps)
     if eval_executor is not None:
         eval_executor.shutdown(wait=True)
 

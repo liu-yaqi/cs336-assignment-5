@@ -31,8 +31,7 @@ from cs336_alignment.utils import (
     evaluate_vllm, 
     load_policy_into_vllm_instance,
     load_math_dataset_and_format,
-    init_log_and_output_dir, 
-    _unwrap_policy_model,
+    init_log_and_output_dir,
     get_eval_example_count)
 
 
@@ -40,12 +39,6 @@ import os
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
 
-
-DEFAULT_LOSS_TYPE: Literal[
-    "no_baseline",
-    "reinforce_with_baseline",
-    "grpo_clip",
-] = "reinforce_with_baseline"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
@@ -79,7 +72,8 @@ class GRPOConfig:
         "no_baseline",
         "reinforce_with_baseline",
         "grpo_clip",
-    ] = DEFAULT_LOSS_TYPE
+        "grpo_no_clip"
+    ] = "reinforce_with_baseline"
     use_std_normalization: bool = True
     seed: int = 69
     eval_every: int = 5
@@ -91,6 +85,8 @@ class GRPOConfig:
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
     use_torch_compile: bool = True
+    norm_type: Literal["constant", "mean", "normalize"] = "mean"
+    norm_constant: float = 1.0
 
     @property
     def micro_train_batch_size(self) -> int:
@@ -249,12 +245,14 @@ def train_on_rollout_batch(
     epochs_per_rollout_batch: int,
     micro_batch_size: int,
     gradient_accumulation_steps: int,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     cliprange: float,
     pad_token_id: int,
     device_train: str,
     grpo_step: int,
     num_train_steps_per_rollout: int,
+    norm_type: Literal["constant", "mean", "normalize"],
+    norm_constant: float,
     log,
 ) -> dict[str, float]:
     model.train()
@@ -290,7 +288,7 @@ def train_on_rollout_batch(
                     return_token_entropy=True,
                 )
             if "token_entropy" in scored:
-                scored["token_entropy"] = masked_mean(scored["token_entropy"], response_mask, dim=None)
+                scored["token_entropy"] = masked_mean(scored["token_entropy"], response_mask, dim=None).detach().cpu()
                 response_entropy = scored["token_entropy"]/ gradient_accumulation_steps
                 step_response_entropy += float(response_entropy)
 
@@ -299,10 +297,12 @@ def train_on_rollout_batch(
                 response_mask=response_mask,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 loss_type=loss_type,
+                norm_type=norm_type,
                 raw_rewards=raw_rewards,
                 advantages=advantages,
                 old_log_probs=old_log_probs,
                 cliprange=cliprange,
+                norm_constant=norm_constant
             )
             step_loss += float(loss.detach().cpu())
 
@@ -333,6 +333,7 @@ def train_on_rollout_batch(
                     f"loss={step_loss:.6f} "
                     f"avg_response_entropy={step_response_entropy:.6f} "
                     f"last_clip_fraction={last_clip_fraction:.4f} "
+                    f"grad_norm={grad_norm:.4f}"
                 )
                 wandb.log(
                     {
@@ -366,7 +367,7 @@ def evaluate_model(
     n_eval_examples: int,
     seed: int,
 ) -> dict[str, Any]:
-    load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+    load_policy_into_vllm_instance(model, vllm_model)
     # eval_count = min(n_eval_examples, len(test_prompts))
     # todo
     test_data = random.sample(test_data, min(n_eval_examples, len(test_data)))
@@ -421,9 +422,8 @@ def run_grpo(config: GRPOConfig) -> None:
     if config.use_torch_compile:
         model = torch.compile(model)
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -448,7 +448,7 @@ def run_grpo(config: GRPOConfig) -> None:
         batch_ground_truths = [train_data[index]["expected_answer"] for index in indices]
 
         # compute rewards and advantages for the batch, and tokenize the rollout outputs for training
-        load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+        load_policy_into_vllm_instance(model, vllm_model)
         repeated_prompts, rollout_responses, repeated_ground_truths = build_rollout_batch(
             vllm_model=vllm_model,
             prompts=batch_prompts,
@@ -503,11 +503,13 @@ def run_grpo(config: GRPOConfig) -> None:
             micro_batch_size=config.micro_train_batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             loss_type=config.loss_type,
+            norm_type=config.norm_type,
             cliprange=config.cliprange,
             pad_token_id=tokenizer.pad_token_id,
             device_train=config.device_train,
             grpo_step=grpo_step,
             num_train_steps_per_rollout=config.num_train_steps_per_rollout,
+            norm_constant=config.norm_constant,
             log=log,
         )
 

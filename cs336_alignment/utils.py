@@ -254,6 +254,7 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
 
 
 def load_policy_into_vllm_instance(policy: torch.nn.Module, llm:LLM):
+    policy = _unwrap_policy_model(policy)
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
@@ -363,7 +364,7 @@ def get_eval_example_count(
     # Use a smaller eval set in early/mid training to save time, then switch
     # to the full configured eval size in the final 20% of training.
     warmup_eval_examples = min(first_n_eval_examples, final_n_eval_examples)
-    ramp_start_step = max(1, int(0.8 * n_grpo_steps))
+    ramp_start_step = max(1, int(0.9 * n_grpo_steps))
     if grpo_step < ramp_start_step:
         return warmup_eval_examples
     return final_n_eval_examples
@@ -402,7 +403,7 @@ class Log:
 
 def init_log_and_output_dir(output_dir, model_name):
     now = datetime.now()
-    current_time_name = now.strftime("%m-%d-%H-%M-%S") + "-" + model_name
+    current_time_name = now.strftime("%m%d-%H%M%S") + "-" + model_name
 
     if not os.path.exists(f"{output_dir}/{current_time_name}"):
         os.makedirs(f"{output_dir}/{current_time_name}")

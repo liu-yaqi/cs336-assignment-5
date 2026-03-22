@@ -328,10 +328,7 @@ def run_expert_iteration(config: EIConfig) -> None:
         model = torch.compile(model)
         tokenizer = AutoTokenizer.from_pretrained(config.model_path)
         if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        unwrapped_model = _unwrap_policy_model(model)
-        if unwrapped_model.config.pad_token_id is None:
-            unwrapped_model.config.pad_token_id = tokenizer.pad_token_id
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -349,7 +346,7 @@ def run_expert_iteration(config: EIConfig) -> None:
         train_data = load_math_dataset_and_format(config.train_data_path)
         test_data = load_math_dataset_and_format(config.test_data_path)
 
-        load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+        load_policy_into_vllm_instance(model, vllm_model)
         initial_metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
         log(
             f"[eval 0] accuracy={initial_metrics['accuracy']:.4f} "
@@ -374,7 +371,7 @@ def run_expert_iteration(config: EIConfig) -> None:
             rollout_prompts =  [train_data[idx]["prompt"] for idx in prompt_indices]
             rollout_ground_truths = [train_data[idx]["expected_answer"] for idx in prompt_indices]
 
-            load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+            load_policy_into_vllm_instance(model, vllm_model)
             filtered_samples, rollout_stats = rollout_and_filter(
                 vllm_model=vllm_model,
                 prompts=rollout_prompts,
@@ -418,7 +415,7 @@ def run_expert_iteration(config: EIConfig) -> None:
             )
 
             if ei_step % config.eval_every_ei_steps == 0 or ei_step == config.n_ei_steps:
-                load_policy_into_vllm_instance(_unwrap_policy_model(model), vllm_model)
+                load_policy_into_vllm_instance((model), vllm_model)
                 metrics = evaluate_model(vllm_model=vllm_model, test_data=test_data, config=config)
                 log(
                     f"[eval {ei_step}] accuracy={metrics['accuracy']:.4f} "
