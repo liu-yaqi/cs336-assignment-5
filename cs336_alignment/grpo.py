@@ -311,7 +311,6 @@ def train_on_rollout_batch(
             )
             step_loss += float(loss.detach().cpu())
 
-            clip_fraction_accum += metadata.get("clip_fraction", None)
             if metadata.get("clip_fraction") is not None:
                 clip_fraction_accum += metadata["clip_fraction"].mean().detach().cpu().item() / gradient_accumulation_steps
 
