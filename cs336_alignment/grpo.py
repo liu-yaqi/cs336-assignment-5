@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import numpy as np
+import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -40,7 +41,7 @@ from cs336_alignment.utils import (
 
 import os
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -84,9 +85,10 @@ class GRPOConfig:
     n_first_eval_examples: int = 1024
     top_p: float = 1.0
     cliprange: float = 0.2
-    wandb_project: str = "cs336-grpo"
+    wandb_project: str = "cs336-grpo-dev"
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
+    use_gradient_checkpointing: bool = False
     use_torch_compile: bool = True
     norm_type: Literal["constant", "mean", "normalize"] = "mean"
     norm_constant: float = 1.0
@@ -137,6 +139,49 @@ def apply_wandb_sweep_overrides(config: GRPOConfig) -> GRPOConfig:
 
 def load_config_from_yaml(config_path: str) -> GRPOConfig:
     return load_dataclass_config_from_yaml(config_path, GRPOConfig)
+
+
+def _resolve_cuda_device_index(device: str) -> Optional[int]:
+    if not torch.cuda.is_available():
+        return None
+
+    current_idx = torch.cuda.current_device()
+    device_count = torch.cuda.device_count()
+
+    try:
+        parsed = torch.device(device)
+    except (TypeError, RuntimeError, ValueError):
+        return current_idx
+
+    if parsed.type != "cuda":
+        return None
+
+    device_index = parsed.index if parsed.index is not None else current_idx
+    if device_index < 0 or device_index >= device_count:
+        return current_idx
+    return device_index
+
+
+def _get_gpu_memory_stats_mb(device: str) -> dict[str, Optional[float]]:
+    device_index = _resolve_cuda_device_index(device)
+    if device_index is None:
+        return {
+            "allocated_mb": None,
+            "reserved_mb": None,
+            "max_allocated_mb": None,
+            "max_reserved_mb": None,
+            "device_index": None,
+        }
+
+    torch.cuda.synchronize(device_index)
+    bytes_to_mb = 1024 * 1024
+    return {
+        "allocated_mb": torch.cuda.memory_allocated(device_index) / bytes_to_mb,
+        "reserved_mb": torch.cuda.memory_reserved(device_index) / bytes_to_mb,
+        "max_allocated_mb": torch.cuda.max_memory_allocated(device_index) / bytes_to_mb,
+        "max_reserved_mb": torch.cuda.max_memory_reserved(device_index) / bytes_to_mb,
+        "device_index": float(device_index),
+    }
 
 
 def sample_question_batch(
@@ -288,7 +333,7 @@ def train_on_rollout_batch(
             if "token_entropy" in scored:
                 scored["token_entropy"] = masked_normalize(scored["token_entropy"], response_mask).detach()
                 step_total_response_entropy += float(scored["token_entropy"].cpu().item())
-                step_total_response_tokens += microbatch["response_mask"].sum().detach().cpu().item()
+            step_total_response_tokens += microbatch["response_mask"].sum().detach().cpu().item()
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=scored["log_probs"],
@@ -302,7 +347,7 @@ def train_on_rollout_batch(
                 cliprange=cliprange,
                 norm_constant=norm_constant
             )
-            step_loss += float(loss.detach().cpu())
+            step_loss += float(loss.detach().cpu().item())
 
             if metadata.get("clip_fraction") is not None:
                 clip_fraction_accum += metadata["clip_fraction"].mean().detach().cpu().item() / gradient_accumulation_steps
@@ -326,7 +371,8 @@ def train_on_rollout_batch(
                     f"loss={step_loss:.6f} "
                     f"avg_response_entropy={avg_response_entropy:.6f} "
                     f"step_clip_fraction={clip_fraction_accum:.4f} "
-                    f"grad_norm={grad_norm:.4f}"
+                    f"grad_norm={grad_norm:.4f} "
+                    f"inputid_shape={input_ids.shape}"
                 )
                 wandb.log(
                     {
@@ -425,6 +471,14 @@ def run_grpo(config: GRPOConfig) -> None:
         attn_implementation="flash_attention_2",
         device_map=config.device_train,
     )
+
+    if config.use_gradient_checkpointing:
+        model.config.use_cache = False
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+
     if config.use_torch_compile:
         model = torch.compile(model)
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -504,6 +558,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "rollout batch tensor size must equal rollout_batch_size"
             )
 
+        train_start_time = time.perf_counter()
         train_metrics = train_on_rollout_batch(
             model=model,
             optimizer=optimizer,
@@ -521,6 +576,9 @@ def run_grpo(config: GRPOConfig) -> None:
             norm_constant=config.norm_constant,
             log=log,
         )
+        train_time_sec = time.perf_counter() - train_start_time
+        train_gpu_stats = _get_gpu_memory_stats_mb(config.device_train)
+        vllm_gpu_stats = _get_gpu_memory_stats_mb(config.device_vllm)
 
         log(
             f"[grpo step {grpo_step}] "
@@ -531,6 +589,11 @@ def run_grpo(config: GRPOConfig) -> None:
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
             f"clip_fraction={train_metrics['clip_fraction']:.4f} "
+            f"train_time_sec={train_time_sec:.3f} "
+            f"train_gpu_allocated_mb={train_gpu_stats['allocated_mb'] if train_gpu_stats['allocated_mb'] is not None else -1:.2f} "
+            f"train_gpu_reserved_mb={train_gpu_stats['reserved_mb'] if train_gpu_stats['reserved_mb'] is not None else -1:.2f} "
+            f"train_gpu_max_allocated_mb={train_gpu_stats['max_allocated_mb'] if train_gpu_stats['max_allocated_mb'] is not None else -1:.2f} "
+            f"train_gpu_max_reserved_mb={train_gpu_stats['max_reserved_mb'] if train_gpu_stats['max_reserved_mb'] is not None else -1:.2f}"
         )
         wandb.log(
             {
@@ -542,6 +605,11 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],
                 "train/clip_fraction": train_metrics["clip_fraction"],
+                "train/train_time_sec": train_time_sec,
+                "train/gpu_train_allocated_mb": train_gpu_stats["allocated_mb"],
+                "train/gpu_train_reserved_mb": train_gpu_stats["reserved_mb"],
+                "train/gpu_train_max_allocated_mb": train_gpu_stats["max_allocated_mb"],
+                "train/gpu_train_max_reserved_mb": train_gpu_stats["max_reserved_mb"]
             },
             step=grpo_step,
         )
