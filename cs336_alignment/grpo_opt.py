@@ -1,0 +1,846 @@
+"""GRPO training loop for GSM8K/MATH-style reasoning."""
+
+from __future__ import annotations
+
+import random
+import numpy as np
+import time
+import gc
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import Any, List, Literal, Optional
+
+import torch
+import typer
+import wandb
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from vllm import LLM, SamplingParams
+from cs336_alignment.config_utils import (
+    apply_cli_overrides_to_dataclass,
+    load_dataclass_config_from_yaml,
+)
+
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.grpo_helper import (
+    compute_group_normalized_rewards,
+    grpo_microbatch_train_step,
+    masked_mean
+)
+from cs336_alignment.utils import (
+    init_vllm, 
+    tokenize_prompt_and_output, 
+    get_response_log_probs,
+    evaluate_vllm, 
+    load_policy_into_vllm_instance,
+    load_math_dataset_and_format,
+    init_log_and_output_dir,
+    get_eval_example_count,
+    masked_normalize,
+    set_seed
+    )
+
+
+import os
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
+print(os.environ["PYTORCH_CUDA_ALLOC_CONF"] )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
+DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
+DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "grpo_checkpoints")
+
+
+@dataclass(slots=True)
+class GRPOConfig:
+    train_data_path: str = DEFAULT_TRAIN_DATA_PATH
+    test_data_path: str = DEFAULT_TEST_DATA_PATH
+    model_path: str = DEFAULT_MODEL_PATH
+    output_dir: str = DEFAULT_OUTPUT_DIR
+    device_train: str = "cuda:0"
+    device_vllm: str = "cuda:1"
+    n_grpo_steps: int = 200
+    learning_rate: float = 1e-5
+    advantage_eps: float = 1e-6
+    rollout_batch_size: int = 256
+    group_size: int = 8
+    sampling_temperature: float = 1.0
+    sampling_min_tokens: int = 4
+    sampling_max_tokens: int = 1024
+    epochs_per_rollout_batch: int = 1
+    train_batch_size: int = 256
+    micro_old_log_prob_batch_size: int = 4
+    gradient_accumulation_steps: int = 128
+    gpu_memory_utilization: float = 0.85
+    loss_type: Literal[
+        "no_baseline",
+        "reinforce_with_baseline",
+        "grpo_clip",
+        "grpo_no_clip"
+    ] = "reinforce_with_baseline"
+    use_std_normalization: bool = True
+    seed: int = 69
+    eval_every: int = 5
+    n_eval_examples: int = 2048
+    n_first_eval_examples: int = 1024
+    top_p: float = 1.0
+    cliprange: float = 0.2
+    wandb_project: str = "cs336-grpo-dev"
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
+    use_gradient_checkpointing: bool = False
+    use_torch_compile: bool = True
+    enable_entropy: bool = True
+    prompt_format: Literal["r1_zero", "question_only"] = "r1_zero"
+    microbatch_split_seq_len: int = 1024
+    truncated_align_to: int = 32
+    norm_type: Literal["constant", "mean", "normalize"] = "mean"
+    norm_constant: float = 1.0
+
+    @property
+    def micro_train_batch_size(self) -> int:
+        return self.train_batch_size // self.gradient_accumulation_steps
+
+    @property
+    def n_prompts_per_rollout_batch(self) -> int:
+        return self.rollout_batch_size // self.group_size
+
+    @property
+    def n_microbatches_per_rollout_batch(self) -> int:
+        return self.rollout_batch_size // self.micro_train_batch_size
+    
+    @property
+    def num_train_steps_per_rollout(self) -> int:
+        return self.rollout_batch_size // self.train_batch_size * self.epochs_per_rollout_batch
+
+    def validate(self) -> None:
+        assert self.train_batch_size % self.gradient_accumulation_steps == 0, (
+            "train_batch_size must be divisible by gradient_accumulation_steps"
+        )
+        assert self.rollout_batch_size % self.group_size == 0, (
+            "rollout_batch_size must be divisible by group_size"
+        )
+        assert self.train_batch_size >= self.group_size, (
+            "train_batch_size must be greater than or equal to group_size"
+        )
+        assert self.micro_train_batch_size > 0, "micro_train_batch_size must be positive"
+        assert self.rollout_batch_size % self.micro_train_batch_size == 0, (
+            "rollout_batch_size must be divisible by micro_train_batch_size"
+        )
+        assert self.prompt_format in {"r1_zero", "question_only"}, (
+            "prompt_format must be either 'r1_zero' or 'question_only'"
+        )
+        assert self.microbatch_split_seq_len > 0, "microbatch_split_seq_len must be positive"
+        assert self.truncated_align_to > 0, "truncated_align_to must be positive"
+        if self.loss_type == "grpo_clip" and self.epochs_per_rollout_batch == 1:
+            typer.echo(
+                "Warning: grpo_clip is typically most useful in the off-policy setting with multiple epochs."
+            )
+
+
+def apply_wandb_sweep_overrides(config: GRPOConfig) -> GRPOConfig:
+    config_field_names = {f.name for f in fields(GRPOConfig)}
+    for key, value in dict(wandb.config).items():
+        if key in config_field_names:
+            setattr(config, key, value)
+    return config
+
+
+def load_config_from_yaml(config_path: str) -> GRPOConfig:
+    return load_dataclass_config_from_yaml(config_path, GRPOConfig)
+
+
+def _resolve_cuda_device_index(device: str) -> Optional[int]:
+    if not torch.cuda.is_available():
+        return None
+
+    current_idx = torch.cuda.current_device()
+    device_count = torch.cuda.device_count()
+
+    try:
+        parsed = torch.device(device)
+    except (TypeError, RuntimeError, ValueError):
+        return current_idx
+
+    if parsed.type != "cuda":
+        return None
+
+    device_index = parsed.index if parsed.index is not None else current_idx
+    if device_index < 0 or device_index >= device_count:
+        return current_idx
+    return device_index
+
+
+def _get_gpu_memory_stats_mb(device: str) -> dict[str, Optional[float]]:
+    device_index = _resolve_cuda_device_index(device)
+    if device_index is None:
+        return {
+            "allocated_mb": None,
+            "reserved_mb": None,
+            "max_allocated_mb": None,
+            "max_reserved_mb": None,
+            "device_index": None,
+        }
+
+    torch.cuda.synchronize(device_index)
+    bytes_to_mb = 1024 * 1024
+    return {
+        "allocated_mb": torch.cuda.memory_allocated(device_index) / bytes_to_mb,
+        "reserved_mb": torch.cuda.memory_reserved(device_index) / bytes_to_mb,
+        "max_allocated_mb": torch.cuda.max_memory_allocated(device_index) / bytes_to_mb,
+        "max_reserved_mb": torch.cuda.max_memory_reserved(device_index) / bytes_to_mb,
+        "device_index": float(device_index),
+    }
+
+
+def sample_question_batch(
+    data: list[dict[str, str]],
+    n_prompts_per_rollout_batch: int,
+) -> tuple[list[str], list[str]]:
+    ## todo
+    batch_size = min(n_prompts_per_rollout_batch, len(data))
+    indices = random.sample(range(len(data)), batch_size)
+    batch_prompts = [data[index]["prompt"] for index in indices]
+    batch_ground_truths = [data[index]["expected_answer"] for index in indices]
+    return batch_prompts, batch_ground_truths
+
+
+def build_rollout_batch(
+    vllm_model: LLM,
+    prompts: list[str],
+    ground_truths: list[str],
+    group_size: int,
+    sampling_min_tokens: int,
+    sampling_max_tokens: int,
+    sampling_temperature: float,
+    top_p: float,
+    seed: int,
+) -> tuple[list[str], list[str], list[str]]:
+    sampling_params = SamplingParams(
+        n=group_size,
+        temperature=sampling_temperature,
+        top_p=top_p,
+        max_tokens=sampling_max_tokens,
+        min_tokens=sampling_min_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+        seed=seed,
+    )
+    outputs = vllm_model.generate(prompts, sampling_params)
+
+    repeated_prompts: list[str] = []
+    rollout_responses: list[str] = []
+    repeated_ground_truths: list[str] = []
+
+    for prompt, output_group, ground_truth in zip(prompts, outputs, ground_truths):
+        for completion in output_group.outputs:
+            repeated_prompts.append(prompt)
+            rollout_responses.append(completion.text.strip())
+            repeated_ground_truths.append(ground_truth)
+    return repeated_prompts, rollout_responses, repeated_ground_truths
+
+
+def compute_old_log_probs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    device_train: str,
+    micro_batch_size: int,
+) -> torch.Tensor:
+    old_log_prob_chunks: list[torch.Tensor] = []
+    batch_size = input_ids.shape[0]
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, batch_size, micro_batch_size):
+            end = start + micro_batch_size
+            old_log_probs = get_response_log_probs(
+                model=model,
+                input_ids=input_ids[start:end].to(device_train),
+                labels=labels[start:end].to(device_train),
+                return_token_entropy=False,
+            )["log_probs"]
+            old_log_prob_chunks.append(old_log_probs) # todo:没有移出gpu
+    torch.cuda.empty_cache()
+    model.train()
+    return torch.cat(old_log_prob_chunks, dim=0)
+
+
+def iter_microbatches(
+    batch_tensors: dict[str, torch.Tensor],
+    micro_batch_size: int,
+):
+    rollout_batch_size = batch_tensors["input_ids"].shape[0]
+    # indices = torch.randperm(rollout_batch_size)
+
+    # for start in range(0, batch_size, micro_batch_size):
+    #     batch_indices = indices[start : start + micro_batch_size]
+    #     microbatch = {
+    #         key: value[batch_indices]
+    #         for key, value in batch_tensors.items()
+    #     }
+    #     yield microbatch
+    for start in range(0, rollout_batch_size, micro_batch_size):
+        microbatch = {
+            key: value[start : start + micro_batch_size]
+            for key, value in batch_tensors.items()
+        }
+        yield microbatch
+
+
+def truncate_microbatch_to_active_tokens(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    response_mask: torch.Tensor,
+    pad_token_id: int,
+    align_to: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
+    # Remove padding-only columns, then align for more stable kernel efficiency.
+    active_mask = response_mask.bool() | (labels != pad_token_id)
+    active_lengths = active_mask.long().sum(dim=1)
+    max_len = int(active_lengths.max().item()) if active_lengths.numel() > 0 else labels.shape[1]
+    max_len = max(1, min(max_len, labels.shape[1]))
+
+    max_len = max_len + 1
+
+    if max_len % align_to != 0:
+        max_len = ((max_len + align_to - 1) // align_to) * align_to
+        max_len = min(max_len, labels.shape[1])
+
+    is_truncated = max_len < labels.shape[1]
+    return (
+        input_ids[:, :max_len],
+        labels[:, :max_len],
+        response_mask[:, :max_len],
+        max_len,
+        is_truncated,
+    )
+
+
+def train_on_rollout_batch(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rollout_batch: dict[str, torch.Tensor],
+    epochs_per_rollout_batch: int,
+    micro_batch_size: int,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
+    cliprange: float,
+    pad_token_id: int,
+    device_train: str,
+    grpo_step: int,
+    num_train_steps_per_rollout: int,
+    enable_entropy: bool,
+    microbatch_split_seq_len: int,
+    truncated_align_to: int,
+    norm_type: Literal["constant", "mean", "normalize"],
+    norm_constant: float,
+    log,
+) -> dict[str, float]:
+    model.train()
+
+    last_clip_fraction = 0.0
+    total_loss = 0.0
+    total_entropy = 0.0
+    train_step = 0
+
+    optimizer.zero_grad()
+
+    for epoch in range(epochs_per_rollout_batch):
+        microbatches = iter_microbatches(rollout_batch, micro_batch_size)
+        n_microbatches = (rollout_batch["input_ids"].shape[0] + micro_batch_size - 1) // micro_batch_size
+        step_loss = 0.0
+        clip_fraction_accum = 0.0
+        step_total_response_entropy = 0.0
+        step_total_response_tokens = 0.0
+        step_avg_truncated_seq_len = 0.0
+
+
+        for micro_ind, microbatch in enumerate(microbatches, start=1):
+
+            input_ids_cpu = microbatch["input_ids"]
+            labels_cpu = microbatch["labels"]
+            response_mask_cpu = microbatch["response_mask"]
+            input_ids_cpu, labels_cpu, response_mask_cpu, max_len, is_truncated = truncate_microbatch_to_active_tokens(
+                input_ids=input_ids_cpu,
+                labels=labels_cpu,
+                response_mask=response_mask_cpu,
+                pad_token_id=pad_token_id,
+                align_to=truncated_align_to,
+            )
+            step_avg_truncated_seq_len += input_ids_cpu.shape[1] / gradient_accumulation_steps
+
+            advantages_cpu = microbatch["advantages"]
+            raw_rewards_cpu = microbatch["raw_rewards"]
+            old_log_probs = None
+            if loss_type == "grpo_clip":
+                cached_old_log_probs = microbatch.get("old_log_probs")
+                if cached_old_log_probs is not None:
+                    old_log_probs = cached_old_log_probs[:, :max_len]
+
+            split_chunks = [
+                (
+                    input_ids_cpu,
+                    labels_cpu,
+                    response_mask_cpu,
+                    advantages_cpu,
+                    raw_rewards_cpu,
+                    old_log_probs,
+                )
+            ]
+            if input_ids_cpu.shape[1] > microbatch_split_seq_len and input_ids_cpu.shape[0] > 1:
+                half = input_ids_cpu.shape[0] // 2
+                old_log_probs_1 = old_log_probs[:half] if old_log_probs is not None else None
+                old_log_probs_2 = old_log_probs[half:] if old_log_probs is not None else None
+                split_chunks = [
+                    (
+                        input_ids_cpu[:half],
+                        labels_cpu[:half],
+                        response_mask_cpu[:half],
+                        advantages_cpu[:half],
+                        raw_rewards_cpu[:half],
+                        old_log_probs_1,
+                    ),
+                    (
+                        input_ids_cpu[half:],
+                        labels_cpu[half:],
+                        response_mask_cpu[half:],
+                        advantages_cpu[half:],
+                        raw_rewards_cpu[half:],
+                        old_log_probs_2,
+                    ),
+                ]
+
+            split_factor = len(split_chunks)
+            effective_gradient_accumulation_steps = gradient_accumulation_steps * split_factor
+
+            for (
+                chunk_input_ids_cpu,
+                chunk_labels_cpu,
+                chunk_response_mask_cpu,
+                chunk_advantages_cpu,
+                chunk_raw_rewards_cpu,
+                chunk_old_log_probs,
+            ) in split_chunks:
+                input_ids = chunk_input_ids_cpu.to(device_train, non_blocking=True)
+                labels = chunk_labels_cpu.to(device_train, non_blocking=True)
+                response_mask = chunk_response_mask_cpu.to(device_train, non_blocking=True)
+                advantages = chunk_advantages_cpu.to(device_train, non_blocking=True)
+                raw_rewards = chunk_raw_rewards_cpu.to(device_train, non_blocking=True)
+                old_log_probs = (
+                    chunk_old_log_probs.to(device_train, non_blocking=True)
+                    if chunk_old_log_probs is not None
+                    else None
+                )
+
+                with torch.autocast(device_type=device_train, dtype=torch.bfloat16):
+                    scored = get_response_log_probs(
+                        model=model,
+                        input_ids=input_ids,
+                        labels=labels,
+                        return_token_entropy=enable_entropy,
+                    )
+                if enable_entropy and "token_entropy" in scored:
+                    scored["token_entropy"] = masked_normalize(scored["token_entropy"], response_mask).detach()
+                    step_total_response_entropy += float(scored["token_entropy"].cpu().item())
+                step_total_response_tokens += response_mask.sum().detach().cpu().item()
+
+                loss, metadata = grpo_microbatch_train_step(
+                    policy_log_probs=scored["log_probs"],
+                    response_mask=response_mask,
+                    gradient_accumulation_steps=effective_gradient_accumulation_steps,
+                    loss_type=loss_type,
+                    norm_type=norm_type,
+                    raw_rewards=raw_rewards,
+                    advantages=advantages,
+                    old_log_probs=old_log_probs,
+                    cliprange=cliprange,
+                    norm_constant=norm_constant,
+                )
+                step_loss += float(loss.detach().cpu().item())
+
+                if metadata.get("clip_fraction") is not None:
+                    clip_fraction_accum += (
+                        metadata["clip_fraction"].mean().detach().cpu().item()
+                        / effective_gradient_accumulation_steps
+                    )
+
+                del scored, loss, metadata, input_ids, labels, response_mask, advantages, raw_rewards
+                if old_log_probs is not None:
+                    del old_log_probs
+
+            #===========one train_batch: accumulate gradients and step the optimizer
+            if micro_ind % gradient_accumulation_steps == 0 or micro_ind == n_microbatches:
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+
+                avg_response_entropy = 0.0
+                if enable_entropy and step_total_response_tokens > 0:
+                    avg_response_entropy = step_total_response_entropy / step_total_response_tokens
+                log(
+                    f"rollout grpo_step {grpo_step} "
+                    f"epoch {epoch + 1} "
+                    f"step {train_step}] "
+                    f"loss={step_loss:.6f} "
+                    f"avg_response_entropy={avg_response_entropy:.6f} "
+                    f"step_clip_fraction={clip_fraction_accum:.4f} "
+                    f"grad_norm={grad_norm:.4f} "
+                    f"step_avg_seq_len={step_avg_truncated_seq_len}"
+                )
+                wandb.log(
+                    {
+                        "rollout/step": grpo_step * num_train_steps_per_rollout + train_step,
+                        "rollout/epoch": epoch + 1,
+                        "rollout/grpostep": grpo_step,
+                        "rollout/step_loss": step_loss,
+                        "rollout/step_grad_norm": grad_norm,
+                        "rollout/step_response_entropy": avg_response_entropy,
+                        "rollout/step_clip_fraction": clip_fraction_accum,
+                        "rollout/step_avg_seq_len": step_avg_truncated_seq_len,
+                    }
+                )
+
+                train_step += 1
+                total_loss += step_loss
+                total_entropy += avg_response_entropy
+                last_clip_fraction = clip_fraction_accum
+
+                step_loss = 0.0
+                clip_fraction_accum = 0.0
+                step_total_response_entropy = 0.0
+                step_total_response_tokens = 0.0
+                step_avg_truncated_seq_len = 0.0
+
+
+
+    return {
+        "loss": total_loss / max(train_step, 1),
+        "clip_fraction": last_clip_fraction,
+        "entropy": total_entropy / max(train_step, 1),
+    }
+
+
+def evaluate_model(
+    model: torch.nn.Module,
+    vllm_model: LLM,
+    test_data: list[dict[str, Any]],
+    sampling_min_tokens: int,
+    sampling_max_tokens: int,
+    sampling_temperature: float,
+    top_p: float,
+    n_eval_examples: int,
+    seed: int,
+) -> dict[str, Any]:
+    load_policy_into_vllm_instance(model, vllm_model)
+    # eval_count = min(n_eval_examples, len(test_prompts))
+    # todo
+    test_data = random.sample(test_data, min(n_eval_examples, len(test_data)))
+    eval_sampling_params = SamplingParams(
+        temperature=sampling_temperature,
+        top_p=top_p,
+        max_tokens=sampling_max_tokens,
+        min_tokens=sampling_min_tokens,
+        stop=["</answer>"],
+        seed=seed,
+        include_stop_str_in_output=True,
+    )
+    metrics, results = evaluate_vllm(
+        vllm_model=vllm_model,
+        reward_fn=r1_zero_reward_fn,
+        prompts=[item["prompt"] for item in test_data],
+        ground_truths=[item["expected_answer"] for item in test_data],
+        eval_sampling_params=eval_sampling_params,
+        return_output_results=True,
+    )
+    metrics["sample_outputs"] = results[:200]  # log up to 200 sample outputs
+    return metrics
+
+
+def run_grpo(config: GRPOConfig) -> None:
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        mode=config.wandb_mode,
+        config=asdict(config),
+    )
+    config = apply_wandb_sweep_overrides(config)
+    config.validate()
+    set_seed(config.seed)
+
+    run_name = config.wandb_run_name or "default"
+    log, output_path = init_log_and_output_dir(config.output_dir, run_name)
+    log(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF not set"))
+
+    log(config)
+    output_path = Path(output_path) # 存log和模型
+    output_path.mkdir(parents=True, exist_ok=True)
+    log(f"Artifacts/logs will be saved under: {output_path}")
+
+    train_data = load_math_dataset_and_format(config.train_data_path, config.prompt_format)
+    test_data = load_math_dataset_and_format(config.test_data_path, config.prompt_format)
+    log(f"Number of training examples: {len(train_data)}")
+    log(f"Number of test examples: {len(test_data)}")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map=config.device_train,
+    )
+
+    if config.use_gradient_checkpointing:
+        model.config.use_cache = False
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+
+    if config.use_torch_compile:
+        model = torch.compile(model)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+    )
+
+    vllm_model = init_vllm(
+        model_id=config.model_path,
+        device=config.device_vllm,
+        seed=config.seed,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+    )
+
+    for grpo_step in range(1, config.n_grpo_steps + 1):
+
+        # sample a batch of prompts for this rollout
+        batch_size = min(config.n_prompts_per_rollout_batch, len(train_data))
+        indices = random.sample(range(len(train_data)), batch_size)
+        batch_prompts = [train_data[index]["prompt"] for index in indices]
+        batch_ground_truths = [train_data[index]["expected_answer"] for index in indices]
+
+        # compute rewards and advantages for the batch, and tokenize the rollout outputs for training
+        load_policy_into_vllm_instance(model, vllm_model)
+        repeated_prompts, rollout_responses, repeated_ground_truths = build_rollout_batch(
+            vllm_model=vllm_model,
+            prompts=batch_prompts,
+            ground_truths=batch_ground_truths,
+            group_size=config.group_size,
+            sampling_min_tokens=config.sampling_min_tokens,
+            sampling_max_tokens=config.sampling_max_tokens,
+            sampling_temperature=config.sampling_temperature,
+            top_p=config.top_p,
+            seed=config.seed,
+        )
+
+        advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+            reward_fn=r1_zero_reward_fn,
+            rollout_responses=rollout_responses,
+            repeated_ground_truths=repeated_ground_truths,
+            group_size=config.group_size,
+            advantage_eps=config.advantage_eps,
+            normalize_by_std=config.use_std_normalization,
+        )
+
+        tokenized = tokenize_prompt_and_output(
+            prompt_strs=repeated_prompts,
+            output_strs=rollout_responses,
+            tokenizer=tokenizer,
+        )
+        log(
+            f"[grpo step {grpo_step}] rollout_input_ids_shape={tuple(tokenized['input_ids'].shape)}"
+        )
+        rollout_batch = {
+            "input_ids": tokenized["input_ids"],
+            "labels": tokenized["labels"],
+            "response_mask": tokenized["response_mask"],
+            "advantages": advantages.float().unsqueeze(1),
+            "raw_rewards": raw_rewards.float().unsqueeze(1),
+        }
+
+        if config.loss_type == "grpo_clip":
+            rollout_batch["old_log_probs"] = compute_old_log_probs(
+                model=model,
+                input_ids=tokenized["input_ids"],
+                labels=tokenized["labels"],
+                device_train=config.device_train,
+                micro_batch_size=config.micro_old_log_prob_batch_size,
+            )
+            assert rollout_batch["input_ids"].shape[0] == config.rollout_batch_size, (
+                "rollout batch tensor size must equal rollout_batch_size"
+            )
+
+        train_start_time = time.perf_counter()
+        train_metrics = train_on_rollout_batch(
+            model=model,
+            optimizer=optimizer,
+            rollout_batch=rollout_batch,
+            epochs_per_rollout_batch=config.epochs_per_rollout_batch,
+            micro_batch_size=config.micro_train_batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            loss_type=config.loss_type,
+            norm_type=config.norm_type,
+            cliprange=config.cliprange,
+            pad_token_id=tokenizer.pad_token_id,
+            device_train=config.device_train,
+            grpo_step=grpo_step,
+            num_train_steps_per_rollout=config.num_train_steps_per_rollout,
+            enable_entropy=config.enable_entropy,
+            microbatch_split_seq_len=config.microbatch_split_seq_len,
+            truncated_align_to=config.truncated_align_to,
+            norm_constant=config.norm_constant,
+            log=log,
+        )
+        train_time_sec = time.perf_counter() - train_start_time
+        train_gpu_stats = _get_gpu_memory_stats_mb(config.device_train)
+
+        log(
+            f"[grpo step {grpo_step}] "
+            f"total_rewards={reward_metadata['total_rewards']:.4f} "
+            f"format_rewards={reward_metadata['format_rewards']:.4f} "
+            f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
+            f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
+            f"loss={train_metrics['loss']:.6f} "
+            f"entropy={train_metrics['entropy']:.4f}"
+            f"clip_fraction={train_metrics['clip_fraction']:.4f} "
+            f"train_time_sec={train_time_sec:.3f} "
+            f"train_gpu_allocated_mb={train_gpu_stats['allocated_mb'] if train_gpu_stats['allocated_mb'] is not None else -1:.2f} "
+            f"train_gpu_reserved_mb={train_gpu_stats['reserved_mb'] if train_gpu_stats['reserved_mb'] is not None else -1:.2f} "
+            f"train_gpu_max_allocated_mb={train_gpu_stats['max_allocated_mb'] if train_gpu_stats['max_allocated_mb'] is not None else -1:.2f} "
+            f"train_gpu_max_reserved_mb={train_gpu_stats['max_reserved_mb'] if train_gpu_stats['max_reserved_mb'] is not None else -1:.2f}"
+        )
+        wandb.log(
+            {
+                "train/grpo_step": grpo_step,
+                "train/total_rewards": reward_metadata["total_rewards"],
+                "train/format_rewards": reward_metadata["format_rewards"],
+                "train/answer_rewards": reward_metadata["answer_rewards"],
+                "train/normalized_rewards": reward_metadata["normalized_rewards"],
+                "train/loss": train_metrics["loss"],
+                "train/entropy": train_metrics["entropy"],
+                "train/clip_fraction": train_metrics["clip_fraction"],
+                "train/train_time_sec": train_time_sec,
+                "train/gpu_train_allocated_mb": train_gpu_stats["allocated_mb"],
+                "train/gpu_train_reserved_mb": train_gpu_stats["reserved_mb"],
+                "train/gpu_train_max_allocated_mb": train_gpu_stats["max_allocated_mb"],
+                "train/gpu_train_max_reserved_mb": train_gpu_stats["max_reserved_mb"]
+            },
+            step=grpo_step,
+        )
+
+        if grpo_step % config.eval_every == 0 or grpo_step == config.n_grpo_steps:
+            gc.collect()
+            with torch.cuda.device(config.device_train):
+                torch.cuda.empty_cache()
+            eval_example_count = get_eval_example_count(
+                grpo_step=grpo_step,
+                n_grpo_steps=config.n_grpo_steps,
+                final_n_eval_examples=config.n_eval_examples,
+                first_n_eval_examples=config.n_first_eval_examples,
+            )
+            eval_result = evaluate_model(
+                model=model,
+                vllm_model=vllm_model,
+                test_data=test_data,
+                sampling_min_tokens=config.sampling_min_tokens,
+                sampling_max_tokens=config.sampling_max_tokens,
+                sampling_temperature=config.sampling_temperature,
+                top_p=config.top_p,
+                n_eval_examples=eval_example_count,
+                seed=config.seed,
+            )
+            #-----------------eval log mtrics---------------
+            log(
+                f"[===eval step {grpo_step}] "
+                f"n_eval={eval_example_count} "
+                f"accuracy={eval_result['accuracy']:.4f} "
+                f"format_rate={eval_result['format_rate']:.4f}"
+                f"avg_length={eval_result['avg_length']:.2f} "
+            )
+            wandb.log(
+                {
+                    "eval/step": grpo_step,
+                    "eval/accuracy": eval_result["accuracy"],
+                    "eval/format_rate": eval_result["format_rate"],
+                    "eval/avg_length": eval_result["avg_length"],
+                    "eval/avg_correct_length": eval_result["avg_correct_length"],
+                    "eval/avg_incorrect_length": eval_result["avg_incorrect_length"],
+                },
+                step=grpo_step,
+            )
+            #-----------------eval log some sample outputs---------------
+            sample_outputs = eval_result.get("sample_outputs", [])
+            if sample_outputs:
+                sorted_by_reward = sorted(sample_outputs, key=lambda x: x.get("reward", 0.0))
+                selected_indices = {
+                    0,
+                    len(sorted_by_reward) // 4,
+                    len(sorted_by_reward) // 2,
+                    (3 * len(sorted_by_reward)) // 4,
+                    len(sorted_by_reward) - 1,
+                }
+                selected_outputs = [
+                    sorted_by_reward[i]
+                    for i in sorted(selected_indices)
+                    if 0 <= i < len(sorted_by_reward)
+                ]
+                selected_outputs = selected_outputs[:5]
+
+                for idx, sample in enumerate(selected_outputs, start=1):
+                    prompt_preview = sample["prompt"].replace("\n", " ")
+                    output_preview = sample["model_output"].replace("\n", " ")
+                    log(
+                        f"[eval sample {idx}/5 step {grpo_step}] "
+                        f"reward={sample.get('reward', 0.0):.3f} "
+                        f"format_reward={sample.get('format_reward', 0.0):.3f} "
+                        f"answer_reward={sample.get('answer_reward', 0.0):.3f} "
+                        f"response_length={sample.get('response_length', 0)} "
+                        f"prompt='{prompt_preview}' "
+                        f"output='{output_preview}'"
+                    )
+
+            # checkpoint_dir = output_path / f"f{run_name}"
+            # checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # model.save_pretrained(checkpoint_dir)
+            # tokenizer.save_pretrained(checkpoint_dir)
+
+    wandb.finish()
+
+
+def main(
+    config_path: str = typer.Option(
+        "configs/grpo.yaml",
+        help="Path to GRPO YAML config file.",
+    ),
+    wandb_project: Optional[str] = typer.Option("cs336-grpo", help="wandb project name."),
+    wandb_run_name: Optional[str] = typer.Option(None, help="Optional override for wandb run name."),
+    wandb_mode: Optional[str] = typer.Option("online", help="Optional override for wandb mode."),
+    set_values: List[str] = typer.Option(
+        [],
+        "--set",
+        help="Override config values from CLI, e.g. --set learning_rate=3e-6 --set n_grpo_steps=50",
+    ),
+) -> None:
+    config = load_config_from_yaml(config_path)
+    config = apply_cli_overrides_to_dataclass(config, set_values)
+    if wandb_project is not None:
+        config.wandb_project = wandb_project
+    if wandb_run_name is not None:
+        config.wandb_run_name = wandb_run_name
+    if wandb_mode is not None:
+        config.wandb_mode = wandb_mode
+    run_grpo(config)
+
+
+if __name__ == "__main__":
+    typer.run(main)
