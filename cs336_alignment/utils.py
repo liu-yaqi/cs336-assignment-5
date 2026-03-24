@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, List, Tuple, Dict, Optional
+from typing import Any, Callable, List, Tuple, Dict, Optional, Literal
 
 from unittest.mock import patch
 import torch
@@ -16,6 +16,10 @@ from vllm import LLM, SamplingParams
 PROMPT_DIR = Path(__file__).parent / "prompts"
 with open(PROMPT_DIR / "r1_zero.prompt", "r") as f:
     R1_ZERO_PROMPT_TEMPLATE = f.read().strip()
+
+PROMPT_DIR = Path(__file__).parent / "prompts"
+with open(PROMPT_DIR / "question_only.prompt", "r") as f:
+    QUESTION_ONLY_PROMPT_TEMPLATE = f.read().strip()
 
 
 def load_math_dataset(data_path: str) -> list[dict[str, Any]]:
@@ -53,13 +57,40 @@ def format_r1_zero_prompt(problem: str) -> str:
     return R1_ZERO_PROMPT_TEMPLATE.format(question=problem)
 
 
-def load_math_dataset_and_format(data_path: str) -> List[Dict[str, Any]]:
+def format_question_only_prompt(problem: str) -> str:
+    """
+    Format a MATH problem with question-only prompting.
+
+    Uses the prompt template from cs336_alignment/prompts/question_only_prompt.
+
+    Args:
+        problem: The MATH problem text
+
+    Returns:
+        Formatted prompt string
+    """
+    return QUESTION_ONLY_PROMPT_TEMPLATE.format(question=problem)
+
+
+def load_math_dataset_and_format(
+    data_path: str,
+    format_type: Literal["r1_zero", "question_only"] = "r1_zero",
+) -> List[Dict[str, Any]]:
     with open(data_path, "r") as f:
         examples = json.load(f)
 
+    formatter_by_type = {
+        "r1_zero": format_r1_zero_prompt,
+        "question_only": format_question_only_prompt,
+    }
+    formatter = formatter_by_type.get(format_type)
+    if formatter is None:
+        print(f"Unknown format_type '{format_type}', defaulting to 'r1_zero'.")
+        formatter = format_r1_zero_prompt
+
     formatted_examples = []
     for sample in examples:
-        sample['prompt'] = format_r1_zero_prompt(sample['problem'])
+        sample['prompt'] = formatter(sample['problem'])
         formatted_examples.append(sample)
     return formatted_examples
 
@@ -410,6 +441,7 @@ def init_log_and_output_dir(output_dir, model_name):
     output_dir = f"{output_dir}/{current_time_name}"
     log = Log(f"{output_dir}/logs.txt")
     return log, output_dir
+
 
 import numpy as np
 import random

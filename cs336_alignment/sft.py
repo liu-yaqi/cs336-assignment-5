@@ -32,7 +32,7 @@ import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_MODEL_PATH = "/root/autodl-fs/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "sft_gpt-oss-120b.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "sft_checkpoints")

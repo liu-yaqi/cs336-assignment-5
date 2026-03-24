@@ -41,12 +41,12 @@ from cs336_alignment.utils import (
 
 
 import os
-# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
 print(os.environ["PYTORCH_CUDA_ALLOC_CONF"] )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_MODEL_PATH = "/root/autodl-fs/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "grpo_checkpoints")
