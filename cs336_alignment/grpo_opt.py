@@ -46,7 +46,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size
 print(os.environ["PYTORCH_CUDA_ALLOC_CONF"] )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_MODEL_PATH = "/root/autodl-/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "grpo_checkpoints")
@@ -657,6 +657,9 @@ def run_grpo(config: GRPOConfig) -> None:
             output_strs=rollout_responses,
             tokenizer=tokenizer,
         )
+        rollout_avg_length = float(
+            tokenized["response_mask"].sum(dim=1).float().mean().cpu().item()
+        )
         log(
             f"[grpo step {grpo_step}] rollout_input_ids_shape={tuple(tokenized['input_ids'].shape)}"
         )
@@ -710,6 +713,7 @@ def run_grpo(config: GRPOConfig) -> None:
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
+            f"rollout_avg_length={rollout_avg_length:.2f} "
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
             f"clip_fraction={train_metrics['clip_fraction']:.4f} "
@@ -726,6 +730,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/normalized_rewards": reward_metadata["normalized_rewards"],
+                "train/rollout_avg_length": rollout_avg_length,
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],
                 "train/clip_fraction": train_metrics["clip_fraction"],

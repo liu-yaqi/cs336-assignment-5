@@ -545,6 +545,9 @@ def run_grpo(config: GRPOConfig) -> None:
             output_strs=rollout_responses,
             tokenizer=tokenizer,
         )
+        rollout_avg_length = float(
+            tokenized["response_mask"].sum(dim=1).float().mean().cpu().item()
+        )
         log(
             f"[grpo step {grpo_step}] rollout_input_ids_shape={tuple(tokenized['input_ids'].shape)}"
         )
@@ -596,6 +599,7 @@ def run_grpo(config: GRPOConfig) -> None:
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
+            f"rollout_avg_length={rollout_avg_length:.2f} "
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
             f"clip_fraction={train_metrics['clip_fraction']:.4f} "
@@ -612,6 +616,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/normalized_rewards": reward_metadata["normalized_rewards"],
+                "train/rollout_avg_length": rollout_avg_length,
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],
                 "train/clip_fraction": train_metrics["clip_fraction"],
