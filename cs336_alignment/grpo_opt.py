@@ -251,7 +251,7 @@ def compute_old_log_probs(
     old_log_prob_chunks: list[torch.Tensor] = []
     batch_size = input_ids.shape[0]
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, batch_size, micro_batch_size):
             end = start + micro_batch_size
             old_log_probs = get_response_log_probs(
@@ -260,7 +260,7 @@ def compute_old_log_probs(
                 labels=labels[start:end].to(device_train),
                 return_token_entropy=False,
             )["log_probs"]
-            old_log_prob_chunks.append(old_log_probs) # todo:没有移出gpu
+            old_log_prob_chunks.append(old_log_probs.detach().cpu())
     torch.cuda.empty_cache()
     model.train()
     return torch.cat(old_log_prob_chunks, dim=0)
@@ -373,7 +373,7 @@ def train_on_rollout_batch(
             advantages_cpu = microbatch["advantages"]
             raw_rewards_cpu = microbatch["raw_rewards"]
             old_log_probs = None
-            if loss_type == "grpo_clip":
+            if loss_type in {"grpo_clip", "grpo_no_clip"}:
                 cached_old_log_probs = microbatch.get("old_log_probs")
                 if cached_old_log_probs is not None:
                     old_log_probs = cached_old_log_probs[:, :max_len]
@@ -671,7 +671,7 @@ def run_grpo(config: GRPOConfig) -> None:
             "raw_rewards": raw_rewards.float().unsqueeze(1),
         }
 
-        if config.loss_type == "grpo_clip":
+        if config.loss_type in {"grpo_clip", "grpo_no_clip"}:
             rollout_batch["old_log_probs"] = compute_old_log_probs(
                 model=model,
                 input_ids=tokenized["input_ids"],
