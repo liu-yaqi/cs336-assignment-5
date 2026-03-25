@@ -354,6 +354,7 @@ def train_on_rollout_batch(
         step_total_response_entropy = 0.0
         step_total_response_tokens = 0.0
         step_avg_truncated_seq_len = 0.0
+        ratio_accu = 0.0
 
 
         for micro_ind, microbatch in enumerate(microbatches, start=1):
@@ -460,10 +461,9 @@ def train_on_rollout_batch(
                 step_loss += float(loss.detach().cpu().item())
 
                 if metadata.get("clip_fraction") is not None:
-                    clip_fraction_accum += (
-                        metadata["clip_fraction"].mean().detach().cpu().item()
-                        / effective_gradient_accumulation_steps
-                    )
+                    clip_fraction_accum += masked_normalize(metadata["clip_fraction"], response_mask).detach().cpu().item()
+                if metadata.get("ratio") is not None:
+                    ratio_accu += (masked_normalize(metadata["ratio"], response_mask).detach().cpu().item())
 
                 del scored, loss, metadata, input_ids, labels, response_mask, advantages, raw_rewards
                 if old_log_probs is not None:
@@ -483,15 +483,18 @@ def train_on_rollout_batch(
                 avg_response_entropy = 0.0
                 if enable_entropy and step_total_response_tokens > 0:
                     avg_response_entropy = step_total_response_entropy / step_total_response_tokens
+                avg_clip_fraction_accum = clip_fraction_accum / step_total_response_tokens
+                avg_ratio_accu = ratio_accu / step_total_response_tokens
                 log(
                     f"rollout grpo_step {grpo_step} "
                     f"epoch {epoch + 1} "
                     f"step {train_step}] "
                     f"loss={step_loss:.6f} "
                     f"avg_response_entropy={avg_response_entropy:.6f} "
-                    f"step_clip_fraction={clip_fraction_accum:.4f} "
+                    f"step_clip_fraction={avg_clip_fraction_accum:.4f} "
                     f"grad_norm={grad_norm:.4f} "
                     f"step_avg_seq_len={step_avg_truncated_seq_len}"
+                    f"ratio={avg_ratio_accu:.4f}" if loss_type in {"grpo_clip", "grpo_no_clip"} else ""
                 )
                 wandb.log(
                     {
@@ -501,9 +504,10 @@ def train_on_rollout_batch(
                         "rollout/step_loss": step_loss,
                         "rollout/step_grad_norm": grad_norm,
                         "rollout/step_response_entropy": avg_response_entropy,
-                        "rollout/step_clip_fraction": clip_fraction_accum,
+                        "rollout/step_clip_fraction": avg_clip_fraction_accum,
                         "rollout/step_avg_seq_len": step_avg_truncated_seq_len,
-                    }
+                    },
+                    step=grpo_step
                 )
 
                 train_step += 1
@@ -513,6 +517,7 @@ def train_on_rollout_batch(
 
                 step_loss = 0.0
                 clip_fraction_accum = 0.0
+                ratio_accu = 0.0
                 step_total_response_entropy = 0.0
                 step_total_response_tokens = 0.0
                 step_avg_truncated_seq_len = 0.0
@@ -713,6 +718,7 @@ def run_grpo(config: GRPOConfig) -> None:
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
+            f"normalize_mean={reward_metadata['normalize_mean']:.4f} "
             f"rollout_avg_length={rollout_avg_length:.2f} "
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
@@ -730,6 +736,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/normalized_rewards": reward_metadata["normalized_rewards"],
+                "train/normalize_mean": reward_metadata["normalize_mean"],
                 "train/rollout_avg_length": rollout_avg_length,
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],

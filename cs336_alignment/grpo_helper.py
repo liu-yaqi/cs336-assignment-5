@@ -62,6 +62,7 @@ def compute_group_normalized_rewards(
         'format_rewards': sum(format_rewards) / len(format_rewards),
         'answer_rewards': sum(answer_rewards) / len(answer_rewards),
         'normalized_rewards': float(torch.mean(torch.abs(normalized_rewards))),
+        'normalize_mean': float(torch.mean(normalized_rewards)),
 
     }
 
@@ -116,11 +117,13 @@ def compute_grpo_clip_loss(
     v = ratio * advantages
 
     if is_clip:
-        ratio_clipped = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+        ratio_clipped = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
         v_clipped = ratio_clipped * advantages
 
         return -torch.min(v, v_clipped), {
-            "clip_fraction": (v > v_clipped).float().mean()}
+            "clip_fraction": (v > v_clipped).float(),
+            "ratio": ratio,
+            }
     
     else:
         return -v, {"clip_fraction": 0.0}

@@ -316,6 +316,7 @@ def train_on_rollout_batch(
         n_microbatches = (rollout_batch["input_ids"].shape[0] + micro_batch_size - 1) // micro_batch_size
         step_loss = 0.0
         clip_fraction_accum = 0.0
+        ratio_accu = 0.0
         step_total_response_entropy = 0.0
         step_total_response_tokens = 0.0
 
@@ -359,6 +360,9 @@ def train_on_rollout_batch(
             if metadata.get("clip_fraction") is not None:
                 clip_fraction_accum += metadata["clip_fraction"].mean().detach().cpu().item() / gradient_accumulation_steps
 
+            if metadata.get("ratio") is not None:
+                ratio_accu += metadata["ratio"].mean().detach().cpu().item() / gradient_accumulation_steps
+
             #===========one train_batch: accumulate gradients and step the optimizer
             if micro_ind % gradient_accumulation_steps == 0 or micro_ind == n_microbatches:
                 grad_norm = float(
@@ -382,6 +386,11 @@ def train_on_rollout_batch(
                     f"step_clip_fraction={clip_fraction_accum:.4f} "
                     f"grad_norm={grad_norm:.4f} "
                     f"inputid_shape={input_ids.shape}"
+                    + (
+                        f" ratio={ratio_accu:.4f}"
+                        if loss_type in {"grpo_clip", "grpo_no_clip"}
+                        else ""
+                    )
                 )
                 wandb.log(
                     {
@@ -392,7 +401,8 @@ def train_on_rollout_batch(
                         "rollout/step_grad_norm": grad_norm,
                         "rollout/step_response_entropy": avg_response_entropy,
                         "rollout/step_clip_fraction": clip_fraction_accum,
-                    }
+                    },
+                    step = grpo_step
                 )
 
                 train_step += 1
@@ -402,6 +412,7 @@ def train_on_rollout_batch(
 
                 step_loss = 0.0
                 clip_fraction_accum = 0.0
+                ratio_accu = 0.0
                 step_total_response_entropy = 0.0
                 step_total_response_tokens = 0.0
 
@@ -464,6 +475,7 @@ def run_grpo(config: GRPOConfig) -> None:
     run_name = config.wandb_run_name or "default"
     log, output_path = init_log_and_output_dir(config.output_dir, run_name)
     log(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF not set"))
+    log(config.num_train_steps_per_rollout)
 
     log(config)
     output_path = Path(output_path) # 存log和模型
@@ -599,6 +611,7 @@ def run_grpo(config: GRPOConfig) -> None:
             f"format_rewards={reward_metadata['format_rewards']:.4f} "
             f"answer_rewards={reward_metadata['answer_rewards']:.4f} "
             f"normalized_rewards={reward_metadata['normalized_rewards']:.4f} "
+            f"normalize_mean={reward_metadata['normalize_mean']:.4f} "
             f"rollout_avg_length={rollout_avg_length:.2f} "
             f"loss={train_metrics['loss']:.6f} "
             f"entropy={train_metrics['entropy']:.4f}"
@@ -616,6 +629,7 @@ def run_grpo(config: GRPOConfig) -> None:
                 "train/format_rewards": reward_metadata["format_rewards"],
                 "train/answer_rewards": reward_metadata["answer_rewards"],
                 "train/normalized_rewards": reward_metadata["normalized_rewards"],
+                "train/normalize_mean": reward_metadata["normalize_mean"],
                 "train/rollout_avg_length": rollout_avg_length,
                 "train/loss": train_metrics["loss"],
                 "train/entropy": train_metrics["entropy"],
