@@ -231,7 +231,8 @@ def get_response_log_probs(
     result = {"log_probs": label_log_probs}
 
     if return_token_entropy:
-        result["token_entropy"] = compute_entropy(logits)
+        with torch.no_grad():
+            result["token_entropy"] = compute_entropy(logits)
     return result
 
 
@@ -289,6 +290,18 @@ def load_policy_into_vllm_instance(policy: torch.nn.Module, llm:LLM):
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+
+
+def unwrap_compiled_model(model: torch.nn.Module) -> torch.nn.Module:
+    return _unwrap_policy_model(model)
+
+
+def save_unwrapped_pretrained(
+    model: torch.nn.Module,
+    save_dir: str | Path,
+) -> None:
+    unwrapped = unwrap_compiled_model(model)
+    unwrapped.save_pretrained(save_dir)
 
 
 def _unwrap_policy_model(model: torch.nn.Module) -> torch.nn.Module:

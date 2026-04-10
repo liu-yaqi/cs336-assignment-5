@@ -30,7 +30,7 @@ from cs336_alignment.utils import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = "/root/autodl-fs/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_MODEL_PATH = "/root/autodl-tmp/qwen-math-1.5b/Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_TRAIN_DATA_PATH = str(REPO_ROOT / "data" / "math" / "train.jsonl")
 DEFAULT_TEST_DATA_PATH = str(REPO_ROOT / "data" / "math" / "val.jsonl")
 DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "logs" / "ei_checkpoints")
@@ -191,7 +191,7 @@ def sft_on_filtered_data(
     model.train()
 
     denom = config.micro_batch_size * config.gradient_accumulation_steps
-    # todo: 改成epoch训练，目前是按照step训练，会有点点问题
+    # todo: 改成epoch训练
     n_sft_steps = max(1, math.ceil((len(filtered_samples) * config.sft_epochs) / denom))
 
     last_loss = 0.0

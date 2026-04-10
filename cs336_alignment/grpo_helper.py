@@ -46,13 +46,12 @@ def compute_group_normalized_rewards(
 
     # Group normalize
     n_groups = len(rollout_responses) // group_size
-    normalized_rewards = torch.zeros_like(raw_rewards)
 
     raw_rewards = raw_rewards.reshape(n_groups, group_size)  # (n_groups, group_size)
     normalized_rewards = raw_rewards - raw_rewards.mean(dim=-1, keepdim=True)  # (n_groups, group_size)
 
+    group_std = raw_rewards.std(dim=-1, keepdim=True)  # (n_groups, 1)
     if normalize_by_std:
-        group_std = raw_rewards.std(dim=-1, keepdim=True)  # (n_groups, 1)
         normalized_rewards = normalized_rewards / (group_std + advantage_eps)
     normalized_rewards = normalized_rewards.flatten()
     raw_rewards = raw_rewards.flatten()
@@ -63,6 +62,7 @@ def compute_group_normalized_rewards(
         'answer_rewards': sum(answer_rewards) / len(answer_rewards),
         'normalized_rewards': float(torch.mean(torch.abs(normalized_rewards))),
         'normalize_mean': float(torch.mean(normalized_rewards)),
+        'group_std': group_std.mean().item(),
 
     }
 
@@ -89,6 +89,31 @@ def compute_naive_policy_gradient_loss(
     loss = -raw_rewards_or_advantages * policy_log_probs
 
     return loss
+
+
+def compute_approx_kl_divergence(
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Compute token-wise approximate KL divergence KL(old || policy).
+
+    This follows the common PPO approximation based on log-ratio of sampled
+    actions: KL ~= exp(log_ratio) - 1 - log_ratio, where
+    log_ratio = log pi(a|s) - log pi_old(a|s).
+
+    Args:
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length),
+            log-probs from the current policy.
+        old_log_probs: torch.Tensor of shape (batch_size, sequence_length),
+            log-probs from the reference/old policy.
+
+    Returns:
+        torch.Tensor of shape (batch_size, sequence_length):
+            approximate KL divergence per token.
+    """
+    log_ratio = policy_log_probs - old_log_probs
+    ratio = torch.exp(log_ratio)
+    return ratio - 1.0 - log_ratio
 
 
 def compute_grpo_clip_loss(
