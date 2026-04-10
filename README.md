@@ -1,6 +1,7 @@
 # CS336 Spring 2025 Assignment 5: Alignment
 
 本项目实现了多种对齐算法，包括 SFT (Supervised Fine-Tuning)、GRPO (Group Relative Policy Optimization)、DPO (Direct Preference Optimization) 等。
+飞书文档有更详细说明以及速度优化 [here](https://scnms1qdn8sz.feishu.cn/wiki/O6FTwIac2iDE44k46whcmJrinKf?from=from_copylink)
 
 ## 实验结果汇总
 
